@@ -27,6 +27,30 @@ describe("API Server", () => {
     expect(Array.isArray(body)).toBe(true);
   });
 
+  test("POST /messages - validates approval requirements before dispatch", async () => {
+    const response = await fetch(`${SERVER_URL}/messages`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ message: "Prepare a fix", requiresApproval: "yes" }),
+    });
+
+    expect(response.status).toBe(400);
+    expect(await response.json()).toEqual({ error: "requiresApproval must be a boolean" });
+  });
+
+  test("POST /executions/:executionId/approval - rejects unauthenticated callbacks", async () => {
+    const response = await fetch(`${SERVER_URL}/executions/test-execution/approval`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        taskId: "test-task",
+        approvalPayload: { action: "continue_user_message" },
+      }),
+    });
+
+    expect(response.status).toBe(401);
+  });
+
   test("POST /events - invalid signature rejected", async () => {
     const response = await fetch(`${SERVER_URL}/events`, {
       method: "POST",

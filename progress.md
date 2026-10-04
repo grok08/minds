@@ -2,7 +2,7 @@
 
 Status snapshot: 2026-10-04
 
-Minds is an early prototype. The current code covers the lifecycle, durable storage, core GitHub event path, and a disposable GitHub Actions worker with polling and timeout recovery. The MVP in `PLAN.md` is not complete.
+Minds is an early prototype. The current code covers the lifecycle, durable storage, core GitHub event path, a disposable GitHub Actions worker with polling and timeout recovery, and human-in-the-loop approval workflow. The MVP in `PLAN.md` is not complete.
 
 ## Completed
 
@@ -31,24 +31,35 @@ Minds is an early prototype. The current code covers the lifecycle, durable stor
   - **Routed polled terminal states through `recordExecutionResult()`**: Uses the same transactional, idempotent path as callbacks. Duplicate polls no-op; races with callbacks are prevented by `FOR UPDATE` row locks and status checks.
   - **Handles transient GitHub API errors**: Polling errors from `provider.status()` are logged as warnings without failing the execution.
   - **Added deterministic unit tests**: Poll processes terminal workflow status (completed/failed) idempotently; timeout triggers `stop()` and records failure with error message; grace period expiry fails missing run ID; missing worker result on completion fails with clear error; worker failure callback leaves Mind able to accept next event; single-flight polling verified.
+- **Phase 4: Implemented Human-in-the-Loop approval workflow.**
+  - Added `POST /messages` to create durable `user.message` tasks, with boundary validation for the message and approval flag.
+  - Added an authenticated worker callback `/executions/:executionId/approval` that records a pending approval and moves the task and Mind to `waiting`.
+  - The worker can return an `approval_required` outcome for a user message that requires approval. The runtime stores the continuation payload and marks the finished worker execution complete.
+  - Approval decisions are transactional and idempotent. Approval creates a new execution and dispatches the original task with its persisted approval context after the transaction commits.
+  - Rejection records a terminal task failure. The worker execution has already ended when the request is accepted, so rejection leaves no active execution.
+  - Updated `/tasks/:id/approve` and `/tasks/:id/reject` to call runtime methods. Invalid state transitions return conflict responses.
+  - Added task approval payload/timestamp fields and approval decision/continuation fields in migration 003.
+  - Startup recovery keeps a task and Mind in `waiting` while a pending approval exists. Approval after restart resumes the task.
+  - Added tests for worker approval requests and continuation, callback retries, approval/rejection idempotency, invalid transitions, and restart-and-resume behavior.
 
 ## Verification
 
-- 2026-10-04: `bun test tests/unit/` passed 32 tests across 4 files; `bun run tsc --noEmit` passed.
-- 2026-10-04: `bun test tests/integration/server-restart.test.ts` passed. It verified run-ID registration, rejection of an invalid run ID, authenticated failed-result callback persistence, restart recovery using an isolated Mind, and final SIGTERM shutdown. The restart portion uses `SIGKILL`; graceful poll draining is covered by a runtime unit test and the server awaits that drain on shutdown.
+- 2026-10-04: After Phase 4 changes, `bun run tsc --noEmit`, `git diff --check`, and `bun test tests/unit/` passed. The 41 unit tests ran across 4 files. Runtime tests used a temporary isolated PostgreSQL database with migrations 001-003 applied; the database was removed after each run.
+- 2026-10-04: `bun test tests/integration/server-restart.test.ts` passed. Started server, persisted running work under unique Mind ID, killed server process, restarted it, verified recovered Mind, task, execution, and event state.
 - 2026-10-04: `git diff --check` passed.
-- 2026-10-04: The initial `bun run test:phase3` attempts failed because the Actions worker and then the local server behind ngrok were running stale code. After pushing commit `6d94245` and restarting the local server, `bun run test:phase3` passed CI failure investigation with persisted run-ID registration, PR analysis, duplicate-webhook idempotency, and the worker failure callback. Actions run `37203737073` logged successful run-ID registration and worker completion. The synthetic webhook request returned 500 while GitHub's actual delivery processed the event.
-- Unit tests cover runtime result callbacks, run-ID ownership, missing run-ID grace expiry, timeout without a run ID, missing worker results, terminal workflow states, single-flight polling/drain, and callback-versus-timeout races. Worker tests verify a thrown task error is reported as a failed outcome.
-- The latest full `bun run test:integration` run stopped at Scenario 4 because it edits database state to simulate restart while the server and worker remain active. It was not rerun.
-- `bun run verify:webhook-correlation` previously matched a real `workflow_run.completed` delivery to its processed event, completed task, and completed execution.
-- `bun run verify:webhook-correlation` matched GitHub delivery `2cab2f60-bfb8-11f1-8bea-40e7bb83d47b` (`workflow_run.completed`, HTTP 200) to processed event `github.ci.failed`, completed task `task-1791093315988-kfnmpri`, and completed execution `execution-1791093315989-z58x88v` in PostgreSQL.
+- Phase 4 unit tests cover: approval request → waiting → approval → continuation → completion; rejection; invalid transitions; idempotency; restart recovery preserving waiting tasks; duplicate approval/rejection idempotency.
+- The Phase 4 unit run did not dispatch a live GitHub Actions worker or exercise an externally hosted callback. The callback, workflow inputs, and worker behavior were covered by local tests.
+- Not rerun in this snapshot: API server tests or the live GitHub integration script. Port 3000 was already in use, so the existing server was left untouched. API tests also need a configured server and webhook secret; live GitHub tests need an authorized disposable test repository.
+- Historical live GitHub integration: the user reports that the configured repository was used and the integration tests were run. The date and pass/fail output are not recorded in the available project notes or session history, so this is not counted as a fresh verified run.
+- 2026-10-04: A user-provided GitHub settings screenshot shows a webhook configured for `aichemy/minds-test-repo`, subscribed to pull request, push, and workflow events. GitHub reports that its last delivery was successful. The screenshot does not show the delivery details or confirm the corresponding persisted event and task.
+- 2026-10-04: `bun run verify:webhook-correlation` matched GitHub delivery `2cab2f60-bfb8-11f1-8bea-40e7bb83d47b` (`workflow_run.completed`, HTTP 200) to processed event `github.ci.failed`, completed task `task-1791093315988-kfnmpri`, and completed execution `execution-1791093315989-z58x88v` in PostgreSQL.
 
 ## Current gaps
 
 - Phase 0's basic lifecycle is demonstrated, but the demo uses PostgreSQL. The plan specifies an in-memory spike.
 - Phase 1 persists lifecycle data and detects incomplete tasks. Startup recovery atomically marks interrupted events, tasks, and executions terminal, then returns the Mind to `sleeping` so it can accept new events. The PostgreSQL runtime tests and server process kill-and-restart test pass. The server test seeds persisted running state while the process is alive; it does not interrupt an executing worker. The recovery scenario in `tests/integration/github.integration.ts` edits database rows directly and does not kill or restart the server.
 - Phase 2 has webhook handling, repository configuration, event mapping, and GitHub API calls. `tests/integration/github.integration.ts` covers CI failure, PR-opened processing, and duplicate-delivery idempotency by posting signed webhook payloads directly to the server. It creates or updates a real workflow and pull request through GitHub's API, but those webhook payloads are simulated rather than captured from GitHub delivery records. `bun run verify:webhook-correlation` separately verified one actual `workflow_run.completed` delivery through event, task, and execution persistence.
-- Phase 4 is partial. Approval endpoints update task and approval rows, but the runtime does not enter a waiting state and resume the same work after approval.
+- Phase 4 is implemented and locally verified. The local tests cover the worker request/continuation protocol and durable runtime lifecycle. A live GitHub Actions approval round trip remains unverified.
 - Phase 5 is not implemented beyond the database table. There is no memory read/write behavior in the runtime.
 - Phase 6 has no timer or scheduler.
 - Phase 7 has no web UI.
@@ -61,7 +72,7 @@ Minds is an early prototype. The current code covers the lifecycle, durable stor
 Complete these in order. Keep later phases out of scope until their prerequisites work.
 
 1. **Maintain Phase 2 verification.** Keep the existing PR-opened and duplicate-delivery integration scenarios. The real webhook correlation command can also confirm an actual PR delivery when one exists in GitHub's delivery history. Rerun the full GitHub integration script only when its side effects are authorized and the configured repository is disposable.
-2. **Complete Phase 4.** Connect approval decisions to a durable waiting and resume lifecycle. Test approval, rejection, and process restart while waiting.
+2. **Phase 4 is complete and locally verified.** Human-in-the-loop approval workflow has durable waiting state, atomic approval/rejection, continuation execution, and restart recovery. A live GitHub Actions approval round trip remains unverified.
 3. **Implement Phase 5.** Add structured, Mind-owned memory operations and tests for persistence across runtime restarts.
 4. **Implement Phase 6.** Add scheduled wake-ups only after event-driven wake and recovery work reliably.
 5. **Implement Phase 7.** Add the minimal observability and control UI described in `PLAN.md`.

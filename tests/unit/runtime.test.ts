@@ -550,4 +550,373 @@ describe("PersistentMindRuntime", () => {
     expect(snapshot.tasks).toHaveLength(1);
     expect(snapshot.executions).toHaveLength(1);
   });
+
+  test("requestApproval moves task to waiting and records approval payload", async () => {
+    const eventId = generateId("test-approval-request");
+    runtime = new PersistentMindRuntime(TEST_MIND_ID, {
+      start: async (_task, execution) => ({
+        ...execution,
+        workflowRunId: 12345,
+        status: "running",
+      }),
+      status: async () => "running",
+      stop: async () => {},
+    }, { intervalMs: 100, timeoutMs: 5000 });
+    await runtime.initialize();
+
+    await runtime.handleEvent({
+      id: eventId,
+      type: "github.ci.failed",
+      payload: JSON.stringify({ runId: 999, workflow: "CI" }),
+    });
+
+    const runningSnapshot = await runtime.snapshot();
+    const runningTask = runningSnapshot.tasks[0];
+    const runningExecution = runningSnapshot.executions[0];
+
+    expect(runningTask.status).toBe("running");
+    expect(runningExecution.status).toBe("running");
+
+    // Request approval with payload
+    await runtime.requestApproval({
+      executionId: runningExecution.id,
+      taskId: runningTask.id,
+      approvalPayload: { fix: "fix the bug", pr: 123 },
+    });
+
+    const waitingSnapshot = await runtime.snapshot();
+    expect(runtime.getMindState()).toBe("waiting");
+    expect(waitingSnapshot.mind.state).toBe("waiting");
+    expect(waitingSnapshot.tasks[0].status).toBe("waiting");
+    expect(waitingSnapshot.tasks[0].approvalPayload).toEqual({ fix: "fix the bug", pr: 123 });
+    expect(waitingSnapshot.tasks[0].approvalRequestedAt).toBeDefined();
+    expect(waitingSnapshot.executions[0].status).toBe("completed");
+
+    // Approval record should exist
+    const approvals = await query("SELECT * FROM approvals WHERE task_id = $1", [runningTask.id]);
+    expect(approvals.rows.length).toBe(1);
+    expect(approvals.rows[0].status).toBe("pending");
+    expect(approvals.rows[0].continuation_data).toEqual({ fix: "fix the bug", pr: 123 });
+
+    // Event should be processed
+    const event = await query<{ processed: boolean }>(
+      "SELECT processed FROM events WHERE id = $1",
+      [eventId]
+    );
+    expect(event.rows[0].processed).toBe(true);
+  });
+
+  test("approveTask resumes task with new execution and preserves approval payload", async () => {
+    const eventId = generateId("test-approval-resume");
+    const continuationResult = "Resumed after approval";
+    let startCallCount = 0;
+    runtime = new PersistentMindRuntime(TEST_MIND_ID, {
+      start: async (_task, execution) => {
+        startCallCount++;
+        if (startCallCount === 2) {
+          await runtime.recordExecutionResult({
+            executionId: execution.id,
+            taskId: execution.taskId,
+            status: "completed",
+            result: continuationResult,
+          });
+        }
+        return {
+          ...execution,
+          workflowRunId: 12345 + startCallCount,
+          status: "running",
+        };
+      },
+      status: async () => "running",
+      stop: async () => {},
+    }, { intervalMs: 100, timeoutMs: 5000 });
+    await runtime.initialize();
+
+    await runtime.handleEvent({
+      id: eventId,
+      type: "github.ci.failed",
+      payload: JSON.stringify({ runId: 111, workflow: "CI" }),
+    });
+
+    const runningSnapshot = await runtime.snapshot();
+    const runningTask = runningSnapshot.tasks[0];
+    const runningExecution = runningSnapshot.executions[0];
+
+    await runtime.requestApproval({
+      executionId: runningExecution.id,
+      taskId: runningTask.id,
+      approvalPayload: { fix: "fix the bug" },
+    });
+
+    // Approve the task
+    await runtime.approveTask(runningTask.id);
+
+    // Poll to complete the resumed execution
+    await runtime.pollExecutions();
+    await runtime.pollExecutions();
+
+    const completedSnapshot = await runtime.snapshot();
+    expect(runtime.getMindState()).toBe("sleeping");
+    expect(completedSnapshot.tasks[0].status).toBe("completed");
+    expect(completedSnapshot.tasks[0].result).toBe(continuationResult);
+    expect(completedSnapshot.executions[0].status).toBe("completed");
+    expect(completedSnapshot.executions[0].result).toContain("Approval requested:");
+
+    // Should have two executions (original + resumed)
+    expect(completedSnapshot.executions.length).toBe(2);
+    // The worker finished after it requested approval.
+    expect(completedSnapshot.executions[0].status).toBe("completed");
+    expect(completedSnapshot.executions[0].result).toContain("Approval requested:");
+    // Second execution should be completed
+    expect(completedSnapshot.executions[1].status).toBe("completed");
+    expect(completedSnapshot.executions[1].result).toBe(continuationResult);
+
+    // Approval record should be updated
+    const approvals = await query("SELECT * FROM approvals WHERE task_id = $1", [runningTask.id]);
+    expect(approvals.rows[0].status).toBe("approved");
+    expect(approvals.rows[0].decision).toBe("approved");
+    expect(approvals.rows[0].decided_at).toBeDefined();
+
+    // Event should be processed
+    const event = await query<{ processed: boolean }>(
+      "SELECT processed FROM events WHERE id = $1",
+      [eventId]
+    );
+    expect(event.rows[0].processed).toBe(true);
+  });
+
+  test("rejectTask fails task and records rejection", async () => {
+    const eventId = generateId("test-approval-reject");
+    runtime = new PersistentMindRuntime(TEST_MIND_ID, {
+      start: async (_task, execution) => ({
+        ...execution,
+        workflowRunId: 12345,
+        status: "running",
+      }),
+      status: async () => "running",
+      stop: async () => {},
+    }, { intervalMs: 100, timeoutMs: 5000 });
+    await runtime.initialize();
+
+    await runtime.handleEvent({
+      id: eventId,
+      type: "github.ci.failed",
+      payload: JSON.stringify({ runId: 222, workflow: "CI" }),
+    });
+
+    const runningSnapshot = await runtime.snapshot();
+    const runningTask = runningSnapshot.tasks[0];
+    const runningExecution = runningSnapshot.executions[0];
+
+    await runtime.requestApproval({
+      executionId: runningExecution.id,
+      taskId: runningTask.id,
+      approvalPayload: { fix: "risky fix" },
+    });
+
+    await runtime.rejectTask(runningTask.id);
+
+    const rejectedSnapshot = await runtime.snapshot();
+    expect(runtime.getMindState()).toBe("sleeping");
+    expect(rejectedSnapshot.tasks[0].status).toBe("failed");
+    expect(rejectedSnapshot.tasks[0].error).toBe("Rejected by human");
+    expect(rejectedSnapshot.executions[0].status).toBe("completed");
+
+    // Approval record should be updated
+    const approvals = await query("SELECT * FROM approvals WHERE task_id = $1", [runningTask.id]);
+    expect(approvals.rows[0].status).toBe("rejected");
+    expect(approvals.rows[0].decision).toBe("rejected");
+    expect(approvals.rows[0].decided_at).toBeDefined();
+
+    // Event should be processed
+    const event = await query<{ processed: boolean }>(
+      "SELECT processed FROM events WHERE id = $1",
+      [eventId]
+    );
+    expect(event.rows[0].processed).toBe(true);
+  });
+
+  test("approveTask and rejectTask reject invalid transitions", async () => {
+    const eventId = generateId("test-approval-invalid-transition");
+    runtime = new PersistentMindRuntime(TEST_MIND_ID, {
+      start: async (_task, execution) => execution,
+      status: async (execution) => execution.status,
+      stop: async () => {},
+    });
+    await runtime.initialize();
+
+    await runtime.handleEvent({
+      id: eventId,
+      type: "github.ci.failed",
+      payload: JSON.stringify({ runId: 333, workflow: "CI" }),
+    });
+
+    const runningSnapshot = await runtime.snapshot();
+    const runningTask = runningSnapshot.tasks[0];
+    const runningExecution = runningSnapshot.executions[0];
+
+    // Cannot approve a running task
+    await expect(runtime.approveTask(runningTask.id)).rejects.toThrow("running");
+
+    // Cannot reject a running task
+    await expect(runtime.rejectTask(runningTask.id)).rejects.toThrow("running");
+
+    await runtime.requestApproval({
+      executionId: runningExecution.id,
+      taskId: runningTask.id,
+      approvalPayload: { fix: "test", action: "continue" },
+    });
+
+    // Callback retries for the same approval request are idempotent.
+    await runtime.requestApproval({
+      executionId: runningExecution.id,
+      taskId: runningTask.id,
+      approvalPayload: { action: "continue", fix: "test" },
+    });
+
+    // Approve
+    await runtime.approveTask(runningTask.id);
+
+    // Repeated approval does not create another execution.
+    await runtime.approveTask(runningTask.id);
+
+    // Cannot reject after approval (task is running, not waiting)
+    await expect(runtime.rejectTask(runningTask.id)).rejects.toThrow("already approved");
+  });
+
+  test("startup recovery preserves waiting tasks", async () => {
+    const eventId = generateId("test-recovery-waiting");
+    runtime = new PersistentMindRuntime(TEST_MIND_ID, {
+      start: async (_task, execution) => {
+        return {
+          ...execution,
+          workflowRunId: 12345,
+          status: "running",
+        };
+      },
+      status: async () => "running",
+      stop: async () => {},
+    }, { intervalMs: 100, timeoutMs: 5000 });
+    await runtime.initialize();
+
+    await runtime.handleEvent({
+      id: eventId,
+      type: "github.ci.failed",
+      payload: JSON.stringify({ runId: 444, workflow: "CI" }),
+    });
+
+    const runningSnapshot = await runtime.snapshot();
+    const runningTask = runningSnapshot.tasks[0];
+
+    await runtime.requestApproval({
+      executionId: runningSnapshot.executions[0].id,
+      taskId: runningTask.id,
+      approvalPayload: { fix: "test fix" },
+    });
+
+    const waitingSnapshot = await runtime.snapshot();
+    expect(waitingSnapshot.tasks[0].status).toBe("waiting");
+    expect(waitingSnapshot.tasks[0].approvalPayload).toEqual({ fix: "test fix" });
+    expect(waitingSnapshot.mind.state).toBe("waiting");
+
+    // Simulate restart - create new runtime instance
+    runtime = new PersistentMindRuntime(TEST_MIND_ID, {
+      start: async (_task, execution) => ({
+        ...execution,
+        workflowRunId: 54321,
+        status: "completed",
+        result: "Continued after restart",
+      }),
+      status: async () => "running",
+      stop: async () => {},
+    }, { intervalMs: 100, timeoutMs: 5000 });
+    await runtime.initialize();
+
+    const recoveredSnapshot = await runtime.snapshot();
+    // Waiting tasks and the waiting Mind state survive process restart.
+    expect(recoveredSnapshot.tasks[0].status).toBe("waiting");
+    expect(recoveredSnapshot.tasks[0].approvalPayload).toEqual({ fix: "test fix" });
+    expect(recoveredSnapshot.mind.state).toBe("waiting");
+
+    await runtime.approveTask(recoveredSnapshot.tasks[0].id);
+    const resumedSnapshot = await runtime.snapshot();
+    expect(resumedSnapshot.tasks[0].status).toBe("completed");
+    expect(resumedSnapshot.tasks[0].result).toBe("Continued after restart");
+    expect(resumedSnapshot.mind.state).toBe("sleeping");
+  });
+
+  test("approval idempotency: duplicate approve/reject is no-op", async () => {
+    const eventId = generateId("test-approval-idempotency");
+    const continuationResult = "Resumed after approval";
+    let startCallCount = 0;
+    runtime = new PersistentMindRuntime(TEST_MIND_ID, {
+      start: async (_task, execution) => {
+        startCallCount++;
+        return {
+          ...execution,
+          workflowRunId: 12345,
+          status: startCallCount === 2 ? "completed" : "running",
+          result: startCallCount === 2 ? continuationResult : undefined,
+        };
+      },
+      status: async () => "completed",
+      stop: async () => {},
+    });
+    await runtime.initialize();
+
+    await runtime.handleEvent({
+      id: eventId,
+      type: "github.ci.failed",
+      payload: JSON.stringify({ runId: 555, workflow: "CI" }),
+    });
+
+    const runningSnapshot = await runtime.snapshot();
+    const runningTask = runningSnapshot.tasks[0];
+    const runningExecution = runningSnapshot.executions[0];
+
+    await runtime.requestApproval({
+      executionId: runningExecution.id,
+      taskId: runningTask.id,
+      approvalPayload: { fix: "test" },
+    });
+
+    await runtime.approveTask(runningTask.id);
+
+    // Duplicate approve should be no-op.
+    await runtime.approveTask(runningTask.id);
+
+    const snapshot = await runtime.snapshot();
+    expect(snapshot.tasks[0].status).toBe("completed");
+    expect(snapshot.tasks[0].result).toBe(continuationResult);
+    expect(snapshot.executions.length).toBe(2); // One execution requested approval; one resumed it.
+
+    // Test reject idempotency
+    const eventId2 = generateId("test-reject-idempotency");
+    await runtime.handleEvent({
+      id: eventId2,
+      type: "github.ci.failed",
+      payload: JSON.stringify({ runId: 666, workflow: "CI" }),
+    });
+
+    const runningSnapshot2 = await runtime.snapshot();
+    const runningTask2 = runningSnapshot2.tasks.find((task) => task.eventId === eventId2);
+    const runningExecution2 = runningSnapshot2.executions.find((execution) => execution.taskId === runningTask2?.id);
+    if (!runningTask2 || !runningExecution2) {
+      throw new Error("Expected the second task and its execution");
+    }
+
+    await runtime.requestApproval({
+      executionId: runningExecution2.id,
+      taskId: runningTask2.id,
+      approvalPayload: { fix: "test" },
+    });
+
+    await runtime.rejectTask(runningTask2.id);
+    await runtime.rejectTask(runningTask2.id); // Duplicate reject
+
+    const rejectedSnapshot = await runtime.snapshot();
+    const rejectedTask = rejectedSnapshot.tasks.find((task) => task.id === runningTask2.id);
+    expect(rejectedTask?.status).toBe("failed");
+    expect(rejectedTask?.error).toBe("Rejected by human");
+  });
 });

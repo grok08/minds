@@ -6,6 +6,7 @@ interface WorkerEnv {
   EXECUTION_ID: string;
   EVENT_TYPE: string;
   PAYLOAD: string;
+  APPROVAL_PAYLOAD: string;
   MINDS_SERVER_URL: string;
   MINDS_CALLBACK_SECRET: string;
   GITHUB_TOKEN: string;
@@ -14,8 +15,11 @@ interface WorkerEnv {
 }
 
 export type WorkerOutcome =
+  | { status: "approval_required"; approvalPayload: Record<string, unknown> }
   | { status: "completed"; result: string }
   | { status: "failed"; error: string };
+
+type WorkerTaskResult = string | Extract<WorkerOutcome, { status: "approval_required" }>;
 
 function getEnv(): WorkerEnv {
   const required = [
@@ -37,6 +41,7 @@ function getEnv(): WorkerEnv {
     }
     env[key] = value;
   }
+  env.APPROVAL_PAYLOAD = process.env.APPROVAL_PAYLOAD ?? "{}";
   return env as unknown as WorkerEnv;
 }
 
@@ -62,15 +67,19 @@ async function reportRunId(
   }
 }
 
-async function reportResult(
+async function reportOutcome(
   serverUrl: string,
   callbackSecret: string,
   executionId: string,
   taskId: string,
   outcome: WorkerOutcome
 ): Promise<void> {
-  const body = JSON.stringify({ taskId, ...outcome });
-  const response = await fetch(`${serverUrl}/executions/${executionId}/result`, {
+  const isApprovalRequest = outcome.status === "approval_required";
+  const endpoint = isApprovalRequest ? "approval" : "result";
+  const body = isApprovalRequest
+    ? JSON.stringify({ taskId, approvalPayload: outcome.approvalPayload })
+    : JSON.stringify({ taskId, ...outcome });
+  const response = await fetch(`${serverUrl}/executions/${executionId}/${endpoint}`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -80,17 +89,18 @@ async function reportResult(
   });
   if (!response.ok) {
     const text = await response.text();
-    throw new Error(`Failed to report result: ${response.status} ${text}`);
+    throw new Error(`Failed to report worker outcome: ${response.status} ${text}`);
   }
 }
 
 export async function executeAndReport(
-  executeTask: () => Promise<string>,
+  executeTask: () => Promise<WorkerTaskResult>,
   report: (outcome: WorkerOutcome) => Promise<void>
 ): Promise<WorkerOutcome> {
   let outcome: WorkerOutcome;
   try {
-    outcome = { status: "completed", result: await executeTask() };
+    const result = await executeTask();
+    outcome = typeof result === "string" ? { status: "completed", result } : result;
   } catch (error) {
     outcome = {
       status: "failed",
@@ -159,8 +169,61 @@ async function analyzePullRequest(
   return `Analyzed PR #${payload.prNumber}: ${payload.title || pr.data.title}. Files changed: ${fileSummary}${files.data.length > 10 ? "..." : ""}.`;
 }
 
-async function handleUserMessage(payload: GitHubEventPayload): Promise<string> {
+function handleUserMessage(payload: GitHubEventPayload): string {
   return `Received user message: ${JSON.stringify(payload)}`;
+}
+
+function continueUserMessage(
+  payload: GitHubEventPayload,
+  approvalPayload?: Record<string, unknown>
+): WorkerTaskResult {
+  if (approvalPayload) {
+    if (approvalPayload.action !== "continue_user_message") {
+      throw new Error("Unsupported approved continuation action");
+    }
+    return `Continued after human approval: ${String(approvalPayload.message ?? "")}`;
+  }
+
+  if (payload.requiresApproval) {
+    return {
+      status: "approval_required",
+      approvalPayload: {
+        action: "continue_user_message",
+        message: payload.message ?? "",
+      },
+    };
+  }
+
+  return handleUserMessage(payload);
+}
+
+export async function executeWorkerTask(input: {
+  eventType: string;
+  payload: GitHubEventPayload;
+  approvalPayload?: Record<string, unknown>;
+  octokit: Octokit;
+  owner: string;
+  repo: string;
+}): Promise<WorkerTaskResult> {
+  switch (input.eventType) {
+    case "github.ci.failed":
+      return investigateCIFailure(input.octokit, input.owner, input.repo, input.payload);
+    case "github.pull_request.opened":
+      return analyzePullRequest(input.octokit, input.owner, input.repo, input.payload);
+    case "user.message":
+      return continueUserMessage(input.payload, input.approvalPayload);
+    default:
+      return `Handled ${input.eventType}`;
+  }
+}
+
+function parseApprovalPayload(value: string): Record<string, unknown> | undefined {
+  const parsed: unknown = JSON.parse(value);
+  if (parsed === null || parsed === undefined) return undefined;
+  if (typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error("APPROVAL_PAYLOAD must be a JSON object");
+  }
+  return parsed as Record<string, unknown>;
 }
 
 async function main() {
@@ -175,6 +238,7 @@ async function main() {
   } catch {
     // Payload might not be valid JSON
   }
+  const approvalPayload = parseApprovalPayload(env.APPROVAL_PAYLOAD);
 
   // Register the workflow run ID immediately
   try {
@@ -191,17 +255,15 @@ async function main() {
   }
 
   const outcome = await executeAndReport(async () => {
-    switch (env.EVENT_TYPE) {
-      case "github.ci.failed":
-        return investigateCIFailure(octokit, owner, repo, payload);
-      case "github.pull_request.opened":
-        return analyzePullRequest(octokit, owner, repo, payload);
-      case "user.message":
-        return handleUserMessage(payload);
-      default:
-        return `Handled ${env.EVENT_TYPE}`;
-    }
-  }, (result) => reportResult(
+    return executeWorkerTask({
+      eventType: env.EVENT_TYPE,
+      payload,
+      approvalPayload,
+      octokit,
+      owner,
+      repo,
+    });
+  }, (result) => reportOutcome(
       env.MINDS_SERVER_URL,
       env.MINDS_CALLBACK_SECRET,
       env.EXECUTION_ID,

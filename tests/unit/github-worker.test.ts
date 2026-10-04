@@ -1,6 +1,11 @@
 import { describe, expect, test } from "bun:test";
+import { Octokit } from "@octokit/rest";
 import { GitHubWorkerProvider } from "../../packages/providers/github-worker/provider.ts";
-import { executeAndReport, type WorkerOutcome } from "../../packages/providers/github-worker/worker.ts";
+import {
+  executeAndReport,
+  executeWorkerTask,
+  type WorkerOutcome,
+} from "../../packages/providers/github-worker/worker.ts";
 import { Execution, Task } from "../../packages/runtime/src/domain/types.ts";
 
 const eventPayload = {
@@ -82,6 +87,56 @@ describe("GitHubWorkerProvider", () => {
     await expect(provider.start(makeTask(), makeExecution())).rejects.toThrow("GitHub dispatch failed");
   });
 
+  test("dispatches persisted approval context for continuation executions", async () => {
+    const dispatches: Array<{ ref: string; inputs: Record<string, string> }> = [];
+    const provider = makeProvider(async (_workflowFile, payload) => {
+      dispatches.push(payload);
+    });
+    const task = {
+      ...makeTask(),
+      approvalPayload: { action: "continue_user_message", message: "prepare a fix" },
+    };
+
+    await provider.start(task, makeExecution());
+
+    expect(dispatches[0].inputs.approval_payload).toBe(JSON.stringify(task.approvalPayload));
+    expect(dispatches[0].inputs.event_type).toBe("github.ci.failed");
+    expect(dispatches[0].inputs.payload).toBe(JSON.stringify(eventPayload));
+  });
+
+  test("worker requests approval and continues the same user task after approval", async () => {
+    const octokit = new Octokit({ auth: "test-token" });
+    const payload = { message: "prepare a fix", requiresApproval: true };
+    const requested = await executeWorkerTask({
+      eventType: "user.message",
+      payload,
+      octokit,
+      owner: "test-owner",
+      repo: "test-repo",
+    });
+
+    expect(requested).toEqual({
+      status: "approval_required",
+      approvalPayload: {
+        action: "continue_user_message",
+        message: "prepare a fix",
+      },
+    });
+
+    const resumed = await executeWorkerTask({
+      eventType: "user.message",
+      payload,
+      approvalPayload: {
+        action: "continue_user_message",
+        message: "prepare a fix",
+      },
+      octokit,
+      owner: "test-owner",
+      repo: "test-repo",
+    });
+    expect(resumed).toBe("Continued after human approval: prepare a fix");
+  });
+
   test("reports worker task exceptions as failed results", async () => {
     const reported: WorkerOutcome[] = [];
     const outcome = await executeAndReport(
@@ -91,5 +146,20 @@ describe("GitHubWorkerProvider", () => {
 
     expect(outcome).toEqual({ status: "failed", error: "GitHub API request failed" });
     expect(reported).toEqual([{ status: "failed", error: "GitHub API request failed" }]);
+  });
+
+  test("reports an approval request instead of a completed task result", async () => {
+    const approvalRequest = {
+      status: "approval_required" as const,
+      approvalPayload: { action: "continue_user_message", message: "prepare a fix" },
+    };
+    const reported: WorkerOutcome[] = [];
+    const outcome = await executeAndReport(
+      async () => approvalRequest,
+      async (result) => { reported.push(result); }
+    );
+
+    expect(outcome).toEqual(approvalRequest);
+    expect(reported).toEqual([approvalRequest]);
   });
 });

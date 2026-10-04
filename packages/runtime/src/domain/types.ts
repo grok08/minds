@@ -34,6 +34,8 @@ export interface Task {
   eventId: string;
   result?: string;
   error?: string;
+  approvalPayload?: Record<string, unknown>;
+  approvalRequestedAt?: Date;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -47,6 +49,8 @@ export interface TaskRow {
   event_id: string;
   result?: string;
   error?: string;
+  approval_payload?: Record<string, unknown> | null;
+  approval_requested_at?: Date | null;
   created_at: Date;
   updated_at: Date;
 }
@@ -107,6 +111,8 @@ export function toTask(row: TaskRow): Task {
     eventId: row.event_id,
     result: row.result,
     error: row.error,
+    approvalPayload: row.approval_payload ?? undefined,
+    approvalRequestedAt: row.approval_requested_at ?? undefined,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
@@ -153,6 +159,26 @@ export interface RepositoryRow {
   updated_at: Date;
 }
 
+export interface Approval {
+  id: string;
+  taskId: string;
+  status: "pending" | "approved" | "rejected";
+  decision?: "approved" | "rejected";
+  continuationData?: Record<string, unknown>;
+  createdAt: Date;
+  decidedAt?: Date;
+}
+
+export interface ApprovalRow {
+  id: string;
+  task_id: string;
+  status: "pending" | "approved" | "rejected";
+  decision?: "approved" | "rejected" | null;
+  continuation_data?: Record<string, unknown> | null;
+  created_at: Date;
+  decided_at?: Date | null;
+}
+
 export interface GitHubEventPayload {
   repository?: string;
   workflow?: string;
@@ -166,6 +192,8 @@ export interface GitHubEventPayload {
   headSha?: string;
   headRef?: string;
   baseRef?: string;
+  message?: string;
+  requiresApproval?: boolean;
 }
 
 export function toRepository(row: RepositoryRow): Repository {

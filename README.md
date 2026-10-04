@@ -8,7 +8,7 @@ The Mind persists beyond any one task or worker execution. Workers are disposabl
 
 The first MVP uses one Repository Mind whose purpose is to keep a GitHub repository healthy. GitHub is the first external environment, not the definition of a Mind. The MVP tests whether a persistent Mind can react to events, execute durable tasks, wait for approval, resume, preserve its history, and recover after the runtime restarts.
 
-The current prototype stores runtime data in PostgreSQL. Phase 3, the disposable GitHub Actions worker, is implemented and verified. Approval and resume behavior is still incomplete, so the MVP is not complete. See [progress.md](progress.md) for current status and verification results.
+The current prototype stores runtime data in PostgreSQL. Phase 3, the disposable GitHub Actions worker, and Phase 4, durable human approval and resume, are implemented and locally verified. A live GitHub Actions approval round trip remains unverified, so the MVP is not complete. See [progress.md](progress.md) for current status and verification results.
 
 ## Mind and worker responsibilities
 
@@ -30,6 +30,10 @@ For the first MVP, the implemented worker path is:
 3. The GitHub worker provider dispatches a workflow in the configured repository.
 4. The worker registers its workflow run ID and reports its result to the server.
 5. The runtime stores the result and returns the Mind to sleep.
+
+To submit a user message, send `POST /messages` with a non-empty `message`. Set `requiresApproval` to `true` when the worker must wait for a human decision. The worker reports its approval request to the runtime. The runtime persists the request and leaves the Mind in `waiting`. `POST /tasks/:id/approve` dispatches a new worker execution with the saved continuation context. `POST /tasks/:id/reject` records a terminal rejection.
+
+The prototype API does not authenticate user message or approval requests. Do not expose these routes to untrusted networks.
 
 ## Repository layout
 

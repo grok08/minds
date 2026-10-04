@@ -18,6 +18,11 @@ on:
         description: "JSON payload for the task"
         required: true
         type: string
+      approval_payload:
+        description: "Persisted context for an approved continuation"
+        required: false
+        type: string
+        default: "{}"
       minds_server_url:
         description: "Minds server URL for callback"
         required: true
@@ -54,6 +59,7 @@ jobs:
           EXECUTION_ID: ${{ github.event.inputs.execution_id }}
           EVENT_TYPE: ${{ github.event.inputs.event_type }}
           PAYLOAD: ${{ github.event.inputs.payload }}
+          APPROVAL_PAYLOAD: ${{ github.event.inputs.approval_payload }}
           MINDS_SERVER_URL: ${{ github.event.inputs.minds_server_url }}
           MINDS_CALLBACK_SECRET: ${{ secrets.MINDS_CALLBACK_SECRET }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

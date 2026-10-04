@@ -8,6 +8,10 @@ import { generateId, toRepository } from "../../../packages/runtime/src/domain/t
 const server = Fastify({ logger: true });
 const rawBodies = new WeakMap<object, Buffer>();
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
 server.removeContentTypeParser("application/json");
 server.addContentTypeParser(
   "application/json",
@@ -147,6 +151,38 @@ server.post("/events", async (request, reply) => {
   }
 });
 
+server.post("/messages", async (request, reply) => {
+  if (!isRecord(request.body)) {
+    return reply.code(400).send({ error: "Invalid message body" });
+  }
+
+  const { message, requiresApproval } = request.body;
+  if (typeof message !== "string" || !message.trim()) {
+    return reply.code(400).send({ error: "message must be a non-empty string" });
+  }
+  if (requiresApproval !== undefined && typeof requiresApproval !== "boolean") {
+    return reply.code(400).send({ error: "requiresApproval must be a boolean" });
+  }
+
+  const eventId = generateId("user-message");
+  try {
+    await mindRuntime.handleEvent({
+      id: eventId,
+      type: "user.message",
+      payload: JSON.stringify({ message, requiresApproval: requiresApproval === true }),
+      mindId: MIND_ID,
+    });
+    return reply.code(202).send({ message: "User message accepted", eventId });
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : "Unknown error";
+    server.log.error(error);
+    if (errorMessage.includes("Cannot wake a Mind")) {
+      return reply.code(409).send({ error: errorMessage });
+    }
+    return reply.code(500).send({ error: errorMessage });
+  }
+});
+
 server.post("/executions/:executionId/started", async (request, reply) => {
   try {
     const { executionId } = request.params as { executionId: string };
@@ -183,23 +219,65 @@ server.post("/executions/:executionId/result", async (request, reply) => {
       return reply.code(401).send({ error: "Invalid callback secret" });
     }
 
-    const body = request.body as { taskId: string; status: "completed" | "failed"; result?: string; error?: string };
-    const { taskId, status, result, error } = body;
+    if (!isRecord(request.body)) {
+      return reply.code(400).send({ error: "Invalid callback body" });
+    }
+    const { taskId, status, result, error } = request.body;
 
-    if (!taskId || (status !== "completed" && status !== "failed")) {
+    if (typeof taskId !== "string" || !taskId || (status !== "completed" && status !== "failed")) {
       return reply.code(400).send({ error: "Missing taskId or invalid status" });
     }
 
-    if (status === "completed" && !result) {
+    if (status === "completed" && (typeof result !== "string" || !result)) {
       return reply.code(400).send({ error: "Completed status requires a result" });
     }
+    if (error !== undefined && typeof error !== "string") {
+      return reply.code(400).send({ error: "Error must be a string" });
+    }
 
-    await mindRuntime.recordExecutionResult({ executionId, taskId, status, result, error });
+    await mindRuntime.recordExecutionResult({
+      executionId,
+      taskId,
+      status,
+      result: typeof result === "string" ? result : undefined,
+      error: typeof error === "string" ? error : undefined,
+    });
 
     return reply.code(200).send({ message: "Result recorded" });
   } catch (error) {
     const message = error instanceof Error ? error.message : "Unknown error";
     server.log.error(error);
+    return reply.code(500).send({ error: message });
+  }
+});
+
+server.post("/executions/:executionId/approval", async (request, reply) => {
+  try {
+    const { executionId } = request.params as { executionId: string };
+    const callbackSecret = request.headers["x-minds-callback-secret"];
+    if (callbackSecret !== MINDS_CALLBACK_SECRET) {
+      return reply.code(401).send({ error: "Invalid callback secret" });
+    }
+
+    if (!isRecord(request.body)) {
+      return reply.code(400).send({ error: "Invalid callback body" });
+    }
+    const { taskId, approvalPayload } = request.body;
+    if (typeof taskId !== "string" || !taskId || !isRecord(approvalPayload)) {
+      return reply.code(400).send({ error: "Missing taskId or approvalPayload" });
+    }
+
+    await mindRuntime.requestApproval({ executionId, taskId, approvalPayload });
+    return reply.code(200).send({ message: "Approval requested", taskId });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Unknown error";
+    server.log.error(error);
+    if (message.includes("does not belong")) {
+      return reply.code(404).send({ error: "Execution or task not found" });
+    }
+    if (message.includes("status") || message.includes("approval") || message.includes("working")) {
+      return reply.code(409).send({ error: message });
+    }
     return reply.code(500).send({ error: message });
   }
 });
@@ -228,64 +306,62 @@ server.get("/tasks", async () => {
 server.get("/tasks/:id", async (request, reply) => {
   const { id } = request.params as { id: string };
   const result = await query("SELECT * FROM tasks WHERE id = $1", [id]);
-  
+
   if (result.rows.length === 0) {
     return reply.code(404).send({ error: "Task not found" });
   }
-  
+
   return result.rows[0];
 });
 
 server.post("/tasks/:id/approve", async (request, reply) => {
-  const { id } = request.params as { id: string };
-  
-  const taskResult = await query("SELECT * FROM tasks WHERE id = $1", [id]);
-  if (taskResult.rows.length === 0) {
-    return reply.code(404).send({ error: "Task not found" });
+  try {
+    const { id } = request.params as { id: string };
+
+    await mindRuntime.approveTask(id);
+
+    return reply.code(200).send({ message: "Task approved", taskId: id });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Unknown error";
+    server.log.error(error);
+    if (message.includes("not found") || message.includes("not belong")) {
+      return reply.code(404).send({ error: "Task not found" });
+    }
+    if (
+      message.includes("status") ||
+      message.includes("waiting") ||
+      message.includes("approval") ||
+      message.includes("working")
+    ) {
+      return reply.code(409).send({ error: message });
+    }
+    return reply.code(500).send({ error: message });
   }
-  
-  const task = taskResult.rows[0];
-  if (task.status !== "waiting") {
-    return reply.code(400).send({ error: "Task is not waiting for approval" });
-  }
-  
-  await query(
-    `UPDATE tasks SET status = 'running', updated_at = $1 WHERE id = $2`,
-    [new Date(), id]
-  );
-  
-  await query(
-    `INSERT INTO approvals (id, task_id, status, decided_at) VALUES ($1, $2, $3, $4)`,
-    [generateId("approval"), id, "approved", new Date()]
-  );
-  
-  return { message: "Task approved", taskId: id };
 });
 
 server.post("/tasks/:id/reject", async (request, reply) => {
-  const { id } = request.params as { id: string };
-  
-  const taskResult = await query("SELECT * FROM tasks WHERE id = $1", [id]);
-  if (taskResult.rows.length === 0) {
-    return reply.code(404).send({ error: "Task not found" });
+  try {
+    const { id } = request.params as { id: string };
+
+    await mindRuntime.rejectTask(id);
+
+    return reply.code(200).send({ message: "Task rejected", taskId: id });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Unknown error";
+    server.log.error(error);
+    if (message.includes("not found") || message.includes("not belong")) {
+      return reply.code(404).send({ error: "Task not found" });
+    }
+    if (
+      message.includes("status") ||
+      message.includes("waiting") ||
+      message.includes("approval") ||
+      message.includes("working")
+    ) {
+      return reply.code(409).send({ error: message });
+    }
+    return reply.code(500).send({ error: message });
   }
-  
-  const task = taskResult.rows[0];
-  if (task.status !== "waiting") {
-    return reply.code(400).send({ error: "Task is not waiting for approval" });
-  }
-  
-  await query(
-    `UPDATE tasks SET status = 'failed', error = 'Rejected by human', updated_at = $1 WHERE id = $2`,
-    [new Date(), id]
-  );
-  
-  await query(
-    `INSERT INTO approvals (id, task_id, status, decided_at) VALUES ($1, $2, $3, $4)`,
-    [generateId("approval"), id, "rejected", new Date()]
-  );
-  
-  return { message: "Task rejected", taskId: id };
 });
 
 server.get("/health", async () => {

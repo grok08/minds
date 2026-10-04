@@ -100,6 +100,9 @@ export class GitHubWorkerProvider implements AgentProvider {
         event_type: task.type,
         payload: JSON.stringify(payload),
         minds_server_url: this.mindsServerUrl,
+        ...(task.approvalPayload
+          ? { approval_payload: JSON.stringify(task.approvalPayload) }
+          : {}),
       },
     };
 

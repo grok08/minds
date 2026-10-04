@@ -1,3 +1,4 @@
+import { isDeepStrictEqual } from "node:util";
 import { query, transaction, getClient } from "../../db/src/client.ts";
 import {
   MindState,
@@ -129,7 +130,36 @@ export class PersistentMindRuntime {
 
     }
 
-    await this.transitionState("sleeping");
+    const waitingTasks = await query<{ id: string }>(
+      `SELECT t.id
+       FROM tasks t
+       WHERE t.mind_id = $1
+         AND t.status = 'waiting'
+         AND EXISTS (
+           SELECT 1 FROM approvals a
+           WHERE a.task_id = t.id AND a.status = 'pending'
+         )
+       ORDER BY t.created_at ASC`,
+      [this.mindId]
+    );
+
+    const invalidWaitingTasks = await query<{ id: string }>(
+      `SELECT t.id
+       FROM tasks t
+       WHERE t.mind_id = $1
+         AND t.status = 'waiting'
+         AND NOT EXISTS (
+           SELECT 1 FROM approvals a
+           WHERE a.task_id = t.id AND a.status = 'pending'
+         )
+       LIMIT 1`,
+      [this.mindId]
+    );
+    if (invalidWaitingTasks.rows.length > 0) {
+      throw new Error(`Waiting task ${invalidWaitingTasks.rows[0].id} has no pending approval`);
+    }
+
+    await this.transitionState(waitingTasks.rows.length > 0 ? "waiting" : "sleeping");
     this.mind = await this.loadMind();
   }
 
@@ -427,6 +457,337 @@ export class PersistentMindRuntime {
           [generateId("transition"), execution.mind_id, execution.mind_state, "sleeping", now]
         );
       }
+    });
+
+    this.mind = await this.loadMind();
+  }
+
+  async requestApproval(input: {
+    executionId: string;
+    taskId: string;
+    approvalPayload: Record<string, unknown>;
+  }): Promise<void> {
+    if (!this.mind) {
+      throw new Error("Runtime not initialized");
+    }
+
+    const now = new Date();
+
+    await transaction(async (client) => {
+      const taskResult = await client.query<{
+        id: string;
+        status: Task["status"];
+        mind_id: string;
+        event_id: string;
+        mind_state: MindState;
+        execution_status: Execution["status"];
+      }>(
+        `SELECT t.id, t.status, t.mind_id, t.event_id, m.state AS mind_state,
+                e.status AS execution_status
+         FROM tasks t
+         JOIN executions e ON e.task_id = t.id
+         JOIN minds m ON m.id = t.mind_id
+         WHERE t.id = $1 AND e.id = $2 AND t.mind_id = $3
+         FOR UPDATE OF t, e, m`,
+        [input.taskId, input.executionId, this.mindId]
+      );
+
+      const task = taskResult.rows[0];
+      if (!task) {
+        throw new Error("Execution does not belong to the task and Mind");
+      }
+
+      if (task.status === "waiting") {
+        const approvalResult = await client.query<{
+          status: string;
+          continuation_data: Record<string, unknown> | null;
+        }>(
+          `SELECT status, continuation_data
+           FROM approvals
+           WHERE task_id = $1
+           ORDER BY created_at DESC
+           LIMIT 1
+           FOR UPDATE`,
+          [input.taskId]
+        );
+        const approval = approvalResult.rows[0];
+        if (
+          approval?.status === "pending" &&
+          isDeepStrictEqual(approval.continuation_data, input.approvalPayload)
+        ) {
+          return;
+        }
+        throw new Error(`Cannot request approval for task in status: ${task.status}`);
+      }
+
+      if (task.status !== "running" || task.execution_status !== "running") {
+        throw new Error("Approval can only be requested by a running execution");
+      }
+
+      if (task.mind_state !== "working") {
+        throw new Error(`Mind is not in working state: ${task.mind_state}`);
+      }
+
+      await client.query(
+        `UPDATE tasks SET status = 'waiting', approval_payload = $1, approval_requested_at = $2, updated_at = $3 WHERE id = $4`,
+        [JSON.stringify(input.approvalPayload), now, now, input.taskId]
+      );
+
+      await client.query(
+        `INSERT INTO approvals (id, task_id, status, decision, continuation_data, created_at, decided_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+        [generateId("approval"), input.taskId, "pending", null, JSON.stringify(input.approvalPayload), now, null]
+      );
+
+      await client.query(
+        `UPDATE executions
+         SET status = 'completed', result = $1, completed_at = $2
+         WHERE id = $3`,
+        [`Approval requested: ${JSON.stringify(input.approvalPayload)}`, now, input.executionId]
+      );
+
+      await client.query(
+        `UPDATE minds SET state = 'waiting', updated_at = $1 WHERE id = $2`,
+        [now, this.mindId]
+      );
+      await client.query(
+        `INSERT INTO state_transitions (id, mind_id, from_state, to_state, created_at)
+         VALUES ($1, $2, $3, $4, $5)`,
+        [generateId("transition"), this.mindId, "working", "waiting", now]
+      );
+
+      await client.query("UPDATE events SET processed = true WHERE id = $1", [task.event_id]);
+    });
+
+    this.mind = await this.loadMind();
+  }
+
+  async approveTask(taskId: string): Promise<void> {
+    if (!this.mind) {
+      throw new Error("Runtime not initialized");
+    }
+
+    const now = new Date();
+
+    const continuation = await transaction(async (client) => {
+      const taskResult = await client.query<TaskRow & { mind_state: MindState }>(
+        `SELECT t.*, m.state AS mind_state
+         FROM tasks t
+         JOIN minds m ON m.id = t.mind_id
+         WHERE t.id = $1 AND t.mind_id = $2
+         FOR UPDATE OF t, m`,
+        [taskId, this.mindId]
+      );
+      const taskRow = taskResult.rows[0];
+      if (!taskRow) {
+        throw new Error("Task does not belong to this Mind");
+      }
+
+      const approvalResult = await client.query<{
+        id: string;
+        status: string;
+        decision: "approved" | "rejected" | null;
+      }>(
+        `SELECT id, status, decision
+         FROM approvals
+         WHERE task_id = $1
+         ORDER BY created_at DESC
+         LIMIT 1
+         FOR UPDATE`,
+        [taskId]
+      );
+      const approval = approvalResult.rows[0];
+      if (!approval) {
+        if (taskRow.status !== "waiting") {
+          throw new Error(`Cannot approve task in status: ${taskRow.status}`);
+        }
+        throw new Error("Task has no approval request");
+      }
+
+      if (approval.decision === "approved") {
+        if (taskRow.status !== "waiting") return null;
+        throw new Error("Approved task is still waiting");
+      }
+      if (approval.decision === "rejected") {
+        throw new Error("Task approval was rejected");
+      }
+      if (approval.status !== "pending") {
+        throw new Error("Task has no pending approval");
+      }
+      if (taskRow.status !== "waiting") {
+        throw new Error(`Cannot approve task in status: ${taskRow.status}`);
+      }
+      if (taskRow.mind_state !== "waiting") {
+        throw new Error(`Mind is not in waiting state: ${taskRow.mind_state}`);
+      }
+
+      const task = toTask(taskRow);
+      const execution: Execution = {
+        id: generateId("execution"),
+        taskId: task.id,
+        provider: "github-worker",
+        status: "running",
+        startedAt: now,
+      };
+
+      await client.query(
+        `UPDATE approvals
+         SET status = 'approved', decision = 'approved', decided_at = $1
+         WHERE id = $2`,
+        [now, approval.id]
+      );
+      await client.query(
+        `INSERT INTO executions (id, task_id, provider, status, started_at, workflow_run_id)
+         VALUES ($1, $2, $3, $4, $5, $6)`,
+        [execution.id, execution.taskId, execution.provider, execution.status, execution.startedAt, null]
+      );
+      await client.query(
+        `UPDATE tasks SET status = 'running', updated_at = $1 WHERE id = $2`,
+        [now, taskId]
+      );
+      await client.query(
+        `UPDATE minds SET state = 'working', updated_at = $1 WHERE id = $2`,
+        [now, this.mindId]
+      );
+      await client.query(
+        `INSERT INTO state_transitions (id, mind_id, from_state, to_state, created_at)
+         VALUES ($1, $2, $3, $4, $5)`,
+        [generateId("transition"), this.mindId, "waiting", "working", now]
+      );
+
+      const taskForProvider: Task = { ...task, status: "running" };
+      return {
+        task: taskForProvider,
+        execution,
+      };
+    });
+
+    this.mind = await this.loadMind();
+    if (!continuation) return;
+
+    try {
+      const providerExecution = await this.provider.start(continuation.task, continuation.execution);
+      if (providerExecution.workflowRunId) {
+        await this.registerWorkflowRunId({
+          executionId: continuation.execution.id,
+          taskId,
+          workflowRunId: providerExecution.workflowRunId,
+        });
+      }
+
+      if (providerExecution.status === "completed") {
+        await this.recordExecutionResult({
+          executionId: continuation.execution.id,
+          taskId,
+          status: providerExecution.result ? "completed" : "failed",
+          result: providerExecution.result,
+          error: providerExecution.result ? undefined : "Worker completed without a result",
+        });
+      } else if (providerExecution.status === "failed") {
+        await this.recordExecutionResult({
+          executionId: continuation.execution.id,
+          taskId,
+          status: "failed",
+          error: providerExecution.error ?? "Worker failed",
+        });
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      await this.recordExecutionResult({
+        executionId: continuation.execution.id,
+        taskId,
+        status: "failed",
+        error: message,
+      });
+      throw error;
+    }
+  }
+
+  async rejectTask(taskId: string): Promise<void> {
+    if (!this.mind) {
+      throw new Error("Runtime not initialized");
+    }
+
+    const now = new Date();
+
+    await transaction(async (client) => {
+      const taskResult = await client.query<{
+        id: string;
+        status: Task["status"];
+        mind_id: string;
+        event_id: string;
+        mind_state: MindState;
+      }>(
+        `SELECT t.id, t.status, t.mind_id, t.event_id, m.state AS mind_state
+         FROM tasks t
+         JOIN minds m ON m.id = t.mind_id
+         WHERE t.id = $1 AND t.mind_id = $2
+         FOR UPDATE OF t, m`,
+        [taskId, this.mindId]
+      );
+
+      const task = taskResult.rows[0];
+      if (!task) {
+        throw new Error("Task does not belong to this Mind");
+      }
+
+      const approvalResult = await client.query<{
+        id: string;
+        status: string;
+        decision: "approved" | "rejected" | null;
+      }>(
+        `SELECT id, status, decision
+         FROM approvals
+         WHERE task_id = $1
+         ORDER BY created_at DESC
+         LIMIT 1
+         FOR UPDATE`,
+        [taskId]
+      );
+      const approval = approvalResult.rows[0];
+      if (!approval) {
+        if (task.status !== "waiting") {
+          throw new Error(`Cannot reject task in status: ${task.status}`);
+        }
+        throw new Error("Task has no approval request");
+      }
+      if (approval.decision === "rejected") {
+        if (task.status === "failed") return;
+        throw new Error("Rejected task is not in a terminal state");
+      }
+      if (approval.decision === "approved") {
+        throw new Error("Task was already approved");
+      }
+      if (approval.status !== "pending") {
+        throw new Error("Task has no pending approval");
+      }
+      if (task.status !== "waiting") {
+        throw new Error(`Cannot reject task in status: ${task.status}`);
+      }
+      if (task.mind_state !== "waiting") {
+        throw new Error(`Mind is not in waiting state: ${task.mind_state}`);
+      }
+
+      await client.query(
+        `UPDATE approvals
+         SET status = 'rejected', decision = 'rejected', decided_at = $1
+         WHERE id = $2`,
+        [now, approval.id]
+      );
+      await client.query(
+        `UPDATE tasks SET status = 'failed', error = 'Rejected by human', updated_at = $1 WHERE id = $2`,
+        [now, taskId]
+      );
+      await client.query(
+        `UPDATE minds SET state = 'sleeping', updated_at = $1 WHERE id = $2`,
+        [now, this.mindId]
+      );
+      await client.query(
+        `INSERT INTO state_transitions (id, mind_id, from_state, to_state, created_at)
+         VALUES ($1, $2, $3, $4, $5)`,
+        [generateId("transition"), this.mindId, "waiting", "sleeping", now]
+      );
+      await client.query("UPDATE events SET processed = true WHERE id = $1", [task.event_id]);
     });
 
     this.mind = await this.loadMind();
