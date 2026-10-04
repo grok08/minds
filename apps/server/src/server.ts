@@ -53,7 +53,6 @@ const githubWorkerProvider = createGitHubWorkerProvider({
     repo: GITHUB_REPO,
   },
   mindsServerUrl: MINDS_SERVER_URL,
-  mindsCallbackSecret: MINDS_CALLBACK_SECRET,
 });
 
 const mindRuntime = new PersistentMindRuntime(MIND_ID, githubWorkerProvider);

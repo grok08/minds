@@ -39,7 +39,6 @@ function makeProvider(dispatchWorkflow: (workflowFile: string, payload: {
   return new GitHubWorkerProvider({
     github: { token: "test-token", owner: "test-owner", repo: "test-repo" },
     mindsServerUrl: "https://minds.example.test",
-    mindsCallbackSecret: "test-callback-secret",
   }, {
     dispatchWorkflow,
     getWorkflowRun: async () => ({ status: "in_progress", conclusion: null }),
@@ -66,7 +65,6 @@ describe("GitHubWorkerProvider", () => {
           event_type: "github.ci.failed",
           payload: JSON.stringify(eventPayload),
           minds_server_url: "https://minds.example.test",
-          minds_callback_secret: "test-callback-secret",
         },
       },
     ]]);

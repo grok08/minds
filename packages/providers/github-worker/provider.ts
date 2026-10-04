@@ -5,7 +5,6 @@ import { createGitHubClient, GitHubClient, GitHubConfig } from "../../github/src
 export interface GitHubWorkerConfig {
   github: GitHubConfig;
   mindsServerUrl: string;
-  mindsCallbackSecret: string;
 }
 
 interface GitHubWorkerClient {
@@ -17,12 +16,10 @@ interface GitHubWorkerClient {
 export class GitHubWorkerProvider implements AgentProvider {
   private readonly githubClient: GitHubWorkerClient;
   private readonly mindsServerUrl: string;
-  private readonly mindsCallbackSecret: string;
 
   constructor(config: GitHubWorkerConfig, githubClient: GitHubWorkerClient = createGitHubClient(config.github)) {
     this.githubClient = githubClient;
     this.mindsServerUrl = config.mindsServerUrl;
-    this.mindsCallbackSecret = config.mindsCallbackSecret;
   }
 
   async start(task: Task, execution: Execution): Promise<Execution> {
@@ -84,7 +81,6 @@ export class GitHubWorkerProvider implements AgentProvider {
         event_type: task.type,
         payload: JSON.stringify(payload),
         minds_server_url: this.mindsServerUrl,
-        minds_callback_secret: this.mindsCallbackSecret,
       },
     };
 

@@ -21,6 +21,7 @@ Minds is an early prototype. The current code covers the lifecycle, durable stor
 ## Verification
 
 - 2026-10-04: `bun test tests/unit/github-worker.test.ts` passed 2 provider tests. They verify task payload and execution identity dispatch, and dispatch failure propagation using a mocked GitHub client. They do not verify a live Actions run or callback persistence.
+- 2026-10-04: `bun test tests/unit/github-events.test.ts tests/unit/github-webhooks.test.ts tests/unit/github-worker.test.ts` passed all 16 tests; `bun run tsc --noEmit` passed. The live GitHub integration was not run because the configured test repository returns 404 for `minds-worker.yml`, so the worker cannot be dispatched there yet.
 - 2026-10-04: `bun run tsc --noEmit` passed.
 - 2026-10-04: `bun test tests/unit/github-events.test.ts tests/unit/github-webhooks.test.ts` passed all 14 tests.
 - 2026-10-04: `bun test tests/unit/runtime.test.ts` passed all 4 PostgreSQL-backed tests, including recovery of an interrupted task and successful handling of a later event. The test seeds persisted running state and initializes a fresh runtime; it does not kill a server process.
