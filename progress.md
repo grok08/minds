@@ -16,7 +16,7 @@ Minds is an early prototype. The current code covers the lifecycle, durable stor
 - Added an Octokit client for workflow-run and pull-request operations.
 - Added unit, database-backed runtime, API, manual, and live GitHub integration checks.
 - Added root `AGENTS.md` guidance for repository scope, architecture, and verification.
-- **Phase 3: Implemented disposable GitHub Actions worker with robust polling and timeout recovery.**
+- **Phase 3: Implemented and verified the disposable GitHub Actions worker with robust polling and timeout recovery.**
   - Created `.github/workflows/minds-worker.yml` workflow that executes outside the Minds server process.
   - Updated `GitHubWorkerProvider` to dispatch workflow via `workflow_dispatch` API instead of running Octokit calls synchronously.
   - Added `workflow_run_id` column to executions table (migration 002).
@@ -37,7 +37,7 @@ Minds is an early prototype. The current code covers the lifecycle, durable stor
 - 2026-10-04: `bun test tests/unit/` passed 32 tests across 4 files; `bun run tsc --noEmit` passed.
 - 2026-10-04: `bun test tests/integration/server-restart.test.ts` passed. It verified run-ID registration, rejection of an invalid run ID, authenticated failed-result callback persistence, restart recovery using an isolated Mind, and final SIGTERM shutdown. The restart portion uses `SIGKILL`; graceful poll draining is covered by a runtime unit test and the server awaits that drain on shutdown.
 - 2026-10-04: `git diff --check` passed.
-- 2026-10-04: `bun run test:phase3` was attempted against `grok08/minds-test-repo`. The real Actions worker completed its CI task, but the new run-ID assertion failed: the test workflow checks out `grok08/minds@main` at `fb3b4e4`, which predates the local worker change that sends `GITHUB_RUN_ID`. The run therefore does not verify the new worker registration path live. The simulated webhook returned 500 while the real delivery completed.
+- 2026-10-04: The initial `bun run test:phase3` attempts failed because the Actions worker and then the local server behind ngrok were running stale code. After pushing commit `6d94245` and restarting the local server, `bun run test:phase3` passed CI failure investigation with persisted run-ID registration, PR analysis, duplicate-webhook idempotency, and the worker failure callback. Actions run `37203737073` logged successful run-ID registration and worker completion. The synthetic webhook request returned 500 while GitHub's actual delivery processed the event.
 - Unit tests cover runtime result callbacks, run-ID ownership, missing run-ID grace expiry, timeout without a run ID, missing worker results, terminal workflow states, single-flight polling/drain, and callback-versus-timeout races. Worker tests verify a thrown task error is reported as a failed outcome.
 - The latest full `bun run test:integration` run stopped at Scenario 4 because it edits database state to simulate restart while the server and worker remain active. It was not rerun.
 - `bun run verify:webhook-correlation` previously matched a real `workflow_run.completed` delivery to its processed event, completed task, and completed execution.
@@ -48,7 +48,6 @@ Minds is an early prototype. The current code covers the lifecycle, durable stor
 - Phase 0's basic lifecycle is demonstrated, but the demo uses PostgreSQL. The plan specifies an in-memory spike.
 - Phase 1 persists lifecycle data and detects incomplete tasks. Startup recovery atomically marks interrupted events, tasks, and executions terminal, then returns the Mind to `sleeping` so it can accept new events. The PostgreSQL runtime tests and server process kill-and-restart test pass. The server test seeds persisted running state while the process is alive; it does not interrupt an executing worker. The recovery scenario in `tests/integration/github.integration.ts` edits database rows directly and does not kill or restart the server.
 - Phase 2 has webhook handling, repository configuration, event mapping, and GitHub API calls. `tests/integration/github.integration.ts` covers CI failure, PR-opened processing, and duplicate-delivery idempotency by posting signed webhook payloads directly to the server. It creates or updates a real workflow and pull request through GitHub's API, but those webhook payloads are simulated rather than captured from GitHub delivery records. `bun run verify:webhook-correlation` separately verified one actual `workflow_run.completed` delivery through event, task, and execution persistence.
-- **Phase 3 recovery is implemented and locally tested, but live worker registration is not yet verified.** Runtime and server tests cover run-ID registration, failure callbacks, missing results, timeouts, polling, and restart recovery. The disposable test workflow still checks out the old public `main`, so it has not exercised the newly changed worker that reports `GITHUB_RUN_ID`.
 - Phase 4 is partial. Approval endpoints update task and approval rows, but the runtime does not enter a waiting state and resume the same work after approval.
 - Phase 5 is not implemented beyond the database table. There is no memory read/write behavior in the runtime.
 - Phase 6 has no timer or scheduler.
@@ -62,12 +61,11 @@ Minds is an early prototype. The current code covers the lifecycle, durable stor
 Complete these in order. Keep later phases out of scope until their prerequisites work.
 
 1. **Maintain Phase 2 verification.** Keep the existing PR-opened and duplicate-delivery integration scenarios. The real webhook correlation command can also confirm an actual PR delivery when one exists in GitHub's delivery history. Rerun the full GitHub integration script only when its side effects are authorized and the configured repository is disposable.
-2. **Finish Phase 3 live verification.** Publish or otherwise point the test workflow at the worker revision that reports `GITHUB_RUN_ID`, then rerun `bun run test:phase3`. The current Actions checkout uses `grok08/minds@main` at `fb3b4e4` and cannot verify local unpushed changes.
-3. **Complete Phase 4.** Connect approval decisions to a durable waiting and resume lifecycle. Test approval, rejection, and process restart while waiting.
-4. **Implement Phase 5.** Add structured, Mind-owned memory operations and tests for persistence across runtime restarts.
-5. **Implement Phase 6.** Add scheduled wake-ups only after event-driven wake and recovery work reliably.
-6. **Implement Phase 7.** Add the minimal observability and control UI described in `PLAN.md`.
-7. **Consider Phases 8 and 9.** Add multiple Minds and providers only after the single-Mind runtime and first worker are stable.
+2. **Complete Phase 4.** Connect approval decisions to a durable waiting and resume lifecycle. Test approval, rejection, and process restart while waiting.
+3. **Implement Phase 5.** Add structured, Mind-owned memory operations and tests for persistence across runtime restarts.
+4. **Implement Phase 6.** Add scheduled wake-ups only after event-driven wake and recovery work reliably.
+5. **Implement Phase 7.** Add the minimal observability and control UI described in `PLAN.md`.
+6. **Consider Phases 8 and 9.** Add multiple Minds and providers only after the single-Mind runtime and first worker are stable.
 
 ## Engineering standards
 
