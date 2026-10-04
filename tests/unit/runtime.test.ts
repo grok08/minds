@@ -148,6 +148,312 @@ describe("PersistentMindRuntime", () => {
     expect(runtime.getMindState()).toBe("working");
   });
 
+  test("registers a workflow run ID only for the matching execution and task", async () => {
+    const eventId = generateId("test-run-id-registration");
+    runtime = new PersistentMindRuntime(TEST_MIND_ID, {
+      start: async (_task, execution) => execution,
+      status: async (execution) => execution.status,
+      stop: async () => {},
+    });
+    await runtime.initialize();
+    await runtime.handleEvent({ id: eventId, type: "github.ci.failed", payload: "{}" });
+
+    const runningSnapshot = await runtime.snapshot();
+    const task = runningSnapshot.tasks[0];
+    const execution = runningSnapshot.executions[0];
+
+    await runtime.registerWorkflowRunId({
+      executionId: execution.id,
+      taskId: task.id,
+      workflowRunId: 12345,
+    });
+
+    const registeredSnapshot = await runtime.snapshot();
+    expect(registeredSnapshot.executions[0].workflowRunId).toBe(12345);
+    await expect(runtime.registerWorkflowRunId({
+      executionId: execution.id,
+      taskId: generateId("wrong-task"),
+      workflowRunId: 67890,
+    })).rejects.toThrow("Execution does not belong to the task and Mind");
+  });
+
+  test("fails an execution that never registers a workflow run ID", async () => {
+    const eventId = generateId("test-missing-run-id");
+    runtime = new PersistentMindRuntime(TEST_MIND_ID, {
+      start: async (_task, execution) => execution,
+      status: async (execution) => execution.status,
+      stop: async () => {},
+    }, { timeoutMs: 60000, callbackGracePeriodMs: 1000 });
+    await runtime.initialize();
+    await runtime.handleEvent({ id: eventId, type: "github.ci.failed", payload: "{}" });
+
+    const runningSnapshot = await runtime.snapshot();
+    const execution = runningSnapshot.executions[0];
+    await query("UPDATE executions SET started_at = $1 WHERE id = $2", [new Date(Date.now() - 2000), execution.id]);
+    await runtime.pollExecutions();
+
+    const failedSnapshot = await runtime.snapshot();
+    expect(failedSnapshot.executions[0].status).toBe("failed");
+    expect(failedSnapshot.executions[0].error).toContain("did not register run ID");
+    expect(failedSnapshot.tasks[0].status).toBe("failed");
+    expect(failedSnapshot.mind.state).toBe("sleeping");
+  });
+
+  test("fails a completed workflow that has no worker result", async () => {
+    const eventId = generateId("test-missing-worker-result");
+    runtime = new PersistentMindRuntime(TEST_MIND_ID, {
+      start: async (_task, execution) => ({ ...execution, workflowRunId: 12345 }),
+      status: async () => "completed",
+      stop: async () => {},
+    });
+    await runtime.initialize();
+    await runtime.handleEvent({ id: eventId, type: "github.ci.failed", payload: "{}" });
+
+    await runtime.pollExecutions();
+
+    const failedSnapshot = await runtime.snapshot();
+    expect(failedSnapshot.executions[0].status).toBe("failed");
+    expect(failedSnapshot.executions[0].error).toBe("Workflow completed but worker result not recorded");
+    expect(failedSnapshot.tasks[0].status).toBe("failed");
+    expect(failedSnapshot.mind.state).toBe("sleeping");
+  });
+
+  test("times out executions even when no workflow run ID was registered", async () => {
+    const eventId = generateId("test-timeout-without-run-id");
+    let stopCalled = false;
+    runtime = new PersistentMindRuntime(TEST_MIND_ID, {
+      start: async (_task, execution) => execution,
+      status: async (execution) => execution.status,
+      stop: async () => { stopCalled = true; },
+    }, { timeoutMs: 1000, callbackGracePeriodMs: 60000 });
+    await runtime.initialize();
+    await runtime.handleEvent({ id: eventId, type: "github.ci.failed", payload: "{}" });
+
+    const runningSnapshot = await runtime.snapshot();
+    const execution = runningSnapshot.executions[0];
+    await query("UPDATE executions SET started_at = $1 WHERE id = $2", [new Date(Date.now() - 5000), execution.id]);
+    await runtime.pollExecutions();
+
+    const failedSnapshot = await runtime.snapshot();
+    expect(stopCalled).toBe(false);
+    expect(failedSnapshot.executions[0].status).toBe("failed");
+    expect(failedSnapshot.executions[0].error).toContain("timed out");
+    expect(failedSnapshot.tasks[0].status).toBe("failed");
+  });
+
+  test("polling is single-flight and stopPolling waits for the active poll", async () => {
+    const eventId = generateId("test-poll-drain");
+    let statusCallCount = 0;
+    let signalStatusStarted: () => void = () => {};
+    let releaseStatus: () => void = () => {};
+    const statusStarted = new Promise<void>((resolve) => { signalStatusStarted = resolve; });
+    const statusGate = new Promise<void>((resolve) => { releaseStatus = resolve; });
+    runtime = new PersistentMindRuntime(TEST_MIND_ID, {
+      start: async (_task, execution) => ({ ...execution, workflowRunId: 12345 }),
+      status: async () => {
+        statusCallCount++;
+        signalStatusStarted();
+        await statusGate;
+        return "running";
+      },
+      stop: async () => {},
+    }, { intervalMs: 1, timeoutMs: 60000 });
+    await runtime.initialize();
+    await runtime.handleEvent({ id: eventId, type: "github.ci.failed", payload: "{}" });
+
+    runtime.startPolling();
+    await statusStarted;
+    await runtime.pollExecutions();
+    expect(statusCallCount).toBe(1);
+
+    let shutdownFinished = false;
+    const shutdown = runtime.stopPolling().then(() => { shutdownFinished = true; });
+    await Promise.resolve();
+    expect(shutdownFinished).toBe(false);
+    releaseStatus();
+    await shutdown;
+    expect(shutdownFinished).toBe(true);
+  });
+
+  test("keeps a callback result when it races with timeout recovery", async () => {
+    const eventId = generateId("test-callback-timeout-race");
+    let signalStopStarted: () => void = () => {};
+    let releaseStop: () => void = () => {};
+    const stopStarted = new Promise<void>((resolve) => { signalStopStarted = resolve; });
+    const stopGate = new Promise<void>((resolve) => { releaseStop = resolve; });
+    runtime = new PersistentMindRuntime(TEST_MIND_ID, {
+      start: async (_task, execution) => ({ ...execution, workflowRunId: 12345 }),
+      status: async () => "running",
+      stop: async () => {
+        signalStopStarted();
+        await stopGate;
+      },
+    }, { timeoutMs: 1000 });
+    await runtime.initialize();
+    await runtime.handleEvent({ id: eventId, type: "github.ci.failed", payload: "{}" });
+
+    const runningSnapshot = await runtime.snapshot();
+    const task = runningSnapshot.tasks[0];
+    const execution = runningSnapshot.executions[0];
+    await query("UPDATE executions SET started_at = $1 WHERE id = $2", [new Date(Date.now() - 5000), execution.id]);
+
+    const poll = runtime.pollExecutions();
+    await stopStarted;
+    await runtime.recordExecutionResult({
+      executionId: execution.id,
+      taskId: task.id,
+      status: "completed",
+      result: "Callback won the timeout race",
+    });
+    releaseStop();
+    await poll;
+
+    const completedSnapshot = await runtime.snapshot();
+    expect(completedSnapshot.executions[0].status).toBe("completed");
+    expect(completedSnapshot.executions[0].result).toBe("Callback won the timeout race");
+    expect(completedSnapshot.tasks[0].status).toBe("completed");
+    expect(completedSnapshot.mind.state).toBe("sleeping");
+  });
+
+  test("pollExecutions processes terminal workflow status and idempotently records results", async () => {
+    const eventId = generateId("test-poll-completed");
+    let pollCallCount = 0;
+    const executionResult = "Worker completed the CI investigation";
+    runtime = new PersistentMindRuntime(TEST_MIND_ID, {
+      start: async (_task, execution) => ({
+        ...execution,
+        workflowRunId: 12345,
+        status: "running",
+      }),
+      status: async (_execution) => {
+        pollCallCount++;
+        if (pollCallCount === 1) return "running";
+        return "completed";
+      },
+      stop: async () => {},
+    }, { intervalMs: 100, timeoutMs: 5000 });
+    await runtime.initialize();
+
+    await runtime.handleEvent({
+      id: eventId,
+      type: "github.ci.failed",
+      payload: JSON.stringify({ runId: 789, workflow: "CI" }),
+    });
+
+    const runningSnapshot = await runtime.snapshot();
+    const runningTask = runningSnapshot.tasks[0];
+    const runningExecution = runningSnapshot.executions[0];
+    expect(runningTask.status).toBe("running");
+    expect(runningExecution.status).toBe("running");
+
+    // Simulate worker callback providing the result before polling picks it up
+    await query(
+      `UPDATE executions SET result = $1 WHERE id = $2`,
+      [executionResult, runningExecution.id]
+    );
+
+    await runtime.pollExecutions();
+    await runtime.pollExecutions();
+
+    const completedSnapshot = await runtime.snapshot();
+    expect(runtime.getMindState()).toBe("sleeping");
+    expect(completedSnapshot.tasks[0].status).toBe("completed");
+    expect(completedSnapshot.executions[0].status).toBe("completed");
+    expect(completedSnapshot.tasks[0].result).toBe(executionResult);
+    expect(completedSnapshot.executions[0].result).toBe(executionResult);
+
+    await runtime.pollExecutions();
+    const afterExtraPoll = await runtime.snapshot();
+    expect(afterExtraPoll.tasks[0].status).toBe("completed");
+  });
+
+  test("pollExecutions handles failed workflow status", async () => {
+    const eventId = generateId("test-poll-failed");
+    let pollCallCount = 0;
+    runtime = new PersistentMindRuntime(TEST_MIND_ID, {
+      start: async (_task, execution) => ({
+        ...execution,
+        workflowRunId: 12345,
+      }),
+      status: async (_execution) => {
+        pollCallCount++;
+        if (pollCallCount === 1) return "running";
+        return "failed";
+      },
+      stop: async () => {},
+    }, { intervalMs: 100, timeoutMs: 5000 });
+    await runtime.initialize();
+
+    await runtime.handleEvent({
+      id: eventId,
+      type: "github.ci.failed",
+      payload: JSON.stringify({ runId: 999, workflow: "CI" }),
+    });
+
+    const runningSnapshot = await runtime.snapshot();
+    const runningTask = runningSnapshot.tasks[0];
+    const runningExecution = runningSnapshot.executions[0];
+
+    await runtime.pollExecutions();
+    await runtime.pollExecutions();
+
+    const failedSnapshot = await runtime.snapshot();
+    expect(runtime.getMindState()).toBe("sleeping");
+    expect(failedSnapshot.tasks[0].status).toBe("failed");
+    expect(failedSnapshot.tasks[0].error).toBe("Workflow failed");
+    expect(failedSnapshot.executions[0].status).toBe("failed");
+    expect(failedSnapshot.executions[0].error).toBe("Workflow failed");
+
+    await runtime.handleEvent({
+      id: generateId("test-event-after-poll-failure"),
+      type: "demo.requested",
+      payload: "Continue after poll failure",
+    });
+    const nextSnapshot = await runtime.snapshot();
+    expect(nextSnapshot.tasks.at(-1)?.status).toBe("running");
+  });
+
+  test("pollExecutions times out stuck execution and stops workflow", async () => {
+    const eventId = generateId("test-poll-timeout");
+    let stopCalled = false;
+    runtime = new PersistentMindRuntime(TEST_MIND_ID, {
+      start: async (_task, execution) => ({
+        ...execution,
+        workflowRunId: 12345,
+      }),
+      status: async () => "running",
+      stop: async () => { stopCalled = true; },
+    }, { intervalMs: 100, timeoutMs: 1000 });
+    await runtime.initialize();
+
+    await runtime.handleEvent({
+      id: eventId,
+      type: "github.ci.failed",
+      payload: JSON.stringify({ runId: 111, workflow: "CI" }),
+    });
+
+    const runningSnapshot = await runtime.snapshot();
+    const runningTask = runningSnapshot.tasks[0];
+    const runningExecution = runningSnapshot.executions[0];
+    expect(runningExecution.workflowRunId).toBe(12345);
+
+    // Manually update startedAt to be old to simulate stuck execution
+    await query(
+      `UPDATE executions SET started_at = $1 WHERE id = $2`,
+      [new Date(Date.now() - 60000), runningExecution.id]
+    );
+
+    await runtime.pollExecutions();
+
+    const timedOutSnapshot = await runtime.snapshot();
+    expect(stopCalled).toBe(true);
+    expect(runtime.getMindState()).toBe("sleeping");
+    expect(timedOutSnapshot.tasks[0].status).toBe("failed");
+    expect(timedOutSnapshot.tasks[0].error).toContain("timed out");
+    expect(timedOutSnapshot.executions[0].status).toBe("failed");
+    expect(timedOutSnapshot.executions[0].error).toContain("timed out");
+  });
+
   test("recovers state after restart", async () => {
     const eventId = generateId("test-event-recovery");
 

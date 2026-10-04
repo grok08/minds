@@ -72,7 +72,7 @@ export interface ExecutionRow {
   error?: string;
   started_at: Date;
   completed_at?: Date;
-  workflow_run_id?: number;
+  workflow_run_id?: number | string | null;
 }
 
 export interface Snapshot {
@@ -113,6 +113,11 @@ export function toTask(row: TaskRow): Task {
 }
 
 export function toExecution(row: ExecutionRow): Execution {
+  const workflowRunId = row.workflow_run_id == null ? undefined : Number(row.workflow_run_id);
+  if (workflowRunId !== undefined && (!Number.isSafeInteger(workflowRunId) || workflowRunId <= 0)) {
+    throw new Error("Invalid workflow run ID in execution row");
+  }
+
   return {
     id: row.id,
     taskId: row.task_id,
@@ -122,7 +127,7 @@ export function toExecution(row: ExecutionRow): Execution {
     error: row.error,
     startedAt: row.started_at,
     completedAt: row.completed_at,
-    workflowRunId: row.workflow_run_id,
+    workflowRunId,
   };
 }
 

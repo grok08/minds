@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { GitHubWorkerProvider } from "../../packages/providers/github-worker/provider.ts";
+import { executeAndReport, type WorkerOutcome } from "../../packages/providers/github-worker/worker.ts";
 import { Execution, Task } from "../../packages/runtime/src/domain/types.ts";
 
 const eventPayload = {
@@ -39,6 +40,7 @@ function makeProvider(dispatchWorkflow: (workflowFile: string, payload: {
   return new GitHubWorkerProvider({
     github: { token: "test-token", owner: "test-owner", repo: "test-repo" },
     mindsServerUrl: "https://minds.example.test",
+    mindsCallbackSecret: "test-secret",
   }, {
     dispatchWorkflow,
     getWorkflowRun: async () => ({ status: "in_progress", conclusion: null }),
@@ -78,5 +80,16 @@ describe("GitHubWorkerProvider", () => {
     });
 
     await expect(provider.start(makeTask(), makeExecution())).rejects.toThrow("GitHub dispatch failed");
+  });
+
+  test("reports worker task exceptions as failed results", async () => {
+    const reported: WorkerOutcome[] = [];
+    const outcome = await executeAndReport(
+      async () => { throw new Error("GitHub API request failed"); },
+      async (result) => { reported.push(result); }
+    );
+
+    expect(outcome).toEqual({ status: "failed", error: "GitHub API request failed" });
+    expect(reported).toEqual([{ status: "failed", error: "GitHub API request failed" }]);
   });
 });

@@ -53,6 +53,7 @@ const githubWorkerProvider = createGitHubWorkerProvider({
     repo: GITHUB_REPO,
   },
   mindsServerUrl: MINDS_SERVER_URL,
+  mindsCallbackSecret: MINDS_CALLBACK_SECRET,
 });
 
 const mindRuntime = new PersistentMindRuntime(MIND_ID, githubWorkerProvider);
@@ -63,6 +64,8 @@ async function initializeRuntime() {
   if (GITHUB_OWNER && GITHUB_REPO && GITHUB_TOKEN) {
     await ensureRepositoryConfig();
   }
+
+  mindRuntime.startPolling();
 }
 
 async function ensureRepositoryConfig() {
@@ -144,6 +147,33 @@ server.post("/events", async (request, reply) => {
   }
 });
 
+server.post("/executions/:executionId/started", async (request, reply) => {
+  try {
+    const { executionId } = request.params as { executionId: string };
+    const callbackSecret = request.headers["x-minds-callback-secret"];
+
+    if (callbackSecret !== MINDS_CALLBACK_SECRET) {
+      return reply.code(401).send({ error: "Invalid callback secret" });
+    }
+
+    const body = request.body as { taskId?: unknown; workflowRunId?: unknown };
+    const { taskId, workflowRunId } = body;
+
+    if (typeof taskId !== "string" || !taskId || typeof workflowRunId !== "number" ||
+        !Number.isSafeInteger(workflowRunId) || workflowRunId <= 0) {
+      return reply.code(400).send({ error: "Missing taskId or workflowRunId" });
+    }
+
+    await mindRuntime.registerWorkflowRunId({ executionId, taskId, workflowRunId });
+
+    return reply.code(200).send({ message: "Run ID registered" });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Unknown error";
+    server.log.error(error);
+    return reply.code(500).send({ error: message });
+  }
+});
+
 server.post("/executions/:executionId/result", async (request, reply) => {
   try {
     const { executionId } = request.params as { executionId: string };
@@ -158,6 +188,10 @@ server.post("/executions/:executionId/result", async (request, reply) => {
 
     if (!taskId || (status !== "completed" && status !== "failed")) {
       return reply.code(400).send({ error: "Missing taskId or invalid status" });
+    }
+
+    if (status === "completed" && !result) {
+      return reply.code(400).send({ error: "Completed status requires a result" });
     }
 
     await mindRuntime.recordExecutionResult({ executionId, taskId, status, result, error });
@@ -270,6 +304,17 @@ async function start() {
     process.exit(1);
   }
 }
+
+const shutdown = async (signal: string) => {
+  console.log(`Received ${signal}, shutting down...`);
+  await mindRuntime.stopPolling();
+  await server.close();
+  await closePool();
+  process.exit(0);
+};
+
+process.on("SIGTERM", () => shutdown("SIGTERM"));
+process.on("SIGINT", () => shutdown("SIGINT"));
 
 start();
 

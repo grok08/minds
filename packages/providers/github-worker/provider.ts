@@ -5,6 +5,7 @@ import { createGitHubClient, GitHubClient, GitHubConfig } from "../../github/src
 export interface GitHubWorkerConfig {
   github: GitHubConfig;
   mindsServerUrl: string;
+  mindsCallbackSecret: string;
 }
 
 interface GitHubWorkerClient {
@@ -16,10 +17,12 @@ interface GitHubWorkerClient {
 export class GitHubWorkerProvider implements AgentProvider {
   private readonly githubClient: GitHubWorkerClient;
   private readonly mindsServerUrl: string;
+  private readonly mindsCallbackSecret: string;
 
   constructor(config: GitHubWorkerConfig, githubClient: GitHubWorkerClient = createGitHubClient(config.github)) {
     this.githubClient = githubClient;
     this.mindsServerUrl = config.mindsServerUrl;
+    this.mindsCallbackSecret = config.mindsCallbackSecret;
   }
 
   async start(task: Task, execution: Execution): Promise<Execution> {
@@ -31,6 +34,22 @@ export class GitHubWorkerProvider implements AgentProvider {
     execution.status = "running";
     
     return execution;
+  }
+
+  async registerWorkflowRunId(executionId: string, taskId: string, workflowRunId: number): Promise<void> {
+    const url = `${this.mindsServerUrl}/executions/${executionId}/started`;
+    const response = await fetch(url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Minds-Callback-Secret": this.mindsCallbackSecret,
+      },
+      body: JSON.stringify({ taskId, workflowRunId }),
+    });
+    if (!response.ok) {
+      const text = await response.text();
+      throw new Error(`Failed to register workflow run ID: ${response.status} ${text}`);
+    }
   }
 
   async status(execution: Execution): Promise<ExecutionStatus> {

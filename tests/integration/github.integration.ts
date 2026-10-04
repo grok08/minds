@@ -10,6 +10,7 @@ interface Env {
   GITHUB_OWNER: string;
   GITHUB_REPO: string;
   GITHUB_WEBHOOK_SECRET: string;
+  MINDS_CALLBACK_SECRET: string;
   NGROK_URL: string;
   DB_HOST: string;
   DB_PORT: string;
@@ -46,6 +47,7 @@ function loadEnv(): Env {
     GITHUB_OWNER: requiredEnv("GITHUB_OWNER"),
     GITHUB_REPO: requiredEnv("GITHUB_REPO"),
     GITHUB_WEBHOOK_SECRET: requiredEnv("GITHUB_WEBHOOK_SECRET"),
+    MINDS_CALLBACK_SECRET: requiredEnv("MINDS_CALLBACK_SECRET"),
     NGROK_URL: requiredEnv("NGROK_URL"),
     DB_HOST: requiredEnv("DB_HOST"),
     DB_PORT: requiredEnv("DB_PORT"),
@@ -105,6 +107,17 @@ async function sendWebhook(eventType: string, payload: object, deliveryId: strin
       "X-GitHub-Delivery": deliveryId,
     },
     body: rawPayload,
+  });
+}
+
+async function reportWorkerFailure(executionId: string, taskId: string, error: string): Promise<Response> {
+  return fetch(`${SERVER_URL}/executions/${executionId}/result`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Minds-Callback-Secret": env.MINDS_CALLBACK_SECRET,
+    },
+    body: JSON.stringify({ taskId, status: "failed", error }),
   });
 }
 
@@ -333,6 +346,13 @@ async function runScenario1_CIFailure() {
   if (!task.result?.includes(`Investigated CI failure for run ${run.id}`)) {
     throw new Error(`Worker returned an unexpected CI investigation result: ${task.result}`);
   }
+  const executionResult = await query<{ workflow_run_id: string | number | null }>(
+    "SELECT workflow_run_id FROM executions WHERE task_id = $1",
+    [task.id]
+  );
+  if (!executionResult.rows[0]?.workflow_run_id) {
+    throw new Error("Worker did not register its GitHub Actions run ID");
+  }
 
   console.log("Verifying mind returned to sleeping...");
   await verifyMindSleeping();
@@ -543,98 +563,62 @@ async function runScenario4_Recovery() {
 }
 
 async function runScenario5_WorkerFailure() {
-  console.log("\n=== Scenario 5: Worker Failure Mid-Execution ===");
-  
-  console.log("Creating broken workflow...");
-  const runId = await createBrokenWorkflow();
-  const run = await waitForWorkflowRun(runId);
-  
-  console.log("Sending webhook...");
-  const deliveryId = `test-delivery-${Date.now()}`;
-  const payload = {
-    action: "completed",
-    workflow_run: {
-      id: run.id,
-      name: run.name,
-      head_branch: run.head_branch,
-      head_sha: run.head_sha,
-      conclusion: run.conclusion,
-      status: run.status,
-      html_url: run.html_url,
-      repository: { full_name: `${env.GITHUB_OWNER}/${env.GITHUB_REPO}` }
-    },
-    repository: { full_name: `${env.GITHUB_OWNER}/${env.GITHUB_REPO}` }
-  };
-  await sendWebhook("workflow_run", payload, deliveryId);
-  
-  console.log("Waiting for task to start...");
-  await new Promise(r => setTimeout(r, 3000));
-  
-  const event = await waitForEventInDB("github.ci.failed", { runId: run.id });
-  const task = await query(
-    "SELECT * FROM tasks WHERE event_id = $1 ORDER BY created_at DESC LIMIT 1",
-    [event.id]
+  console.log("\n=== Scenario 5: Worker Failure Callback ===");
+  const startedAt = new Date();
+  const eventId = generateId("worker-failure-event");
+  const taskId = generateId("worker-failure-task");
+  const executionId = generateId("worker-failure-execution");
+  const failure = "Worker reported an execution failure";
+
+  await query(
+    `INSERT INTO events (id, type, mind_id, payload, processed, created_at)
+     VALUES ($1, $2, $3, $4, false, $5)`,
+    [eventId, "github.ci.failed", "repository", JSON.stringify({ text: "{}" }), startedAt]
   );
-  
-  console.log(`Task ${task.rows[0].id} status: ${task.rows[0].status}`);
-  
-  // Simulate worker disappearance by failing the execution
-  console.log("Simulating worker failure...");
-  const executions = await query(
-    "SELECT * FROM executions WHERE task_id = $1 ORDER BY started_at DESC LIMIT 1",
-    [task.rows[0].id]
+  await query(
+    `INSERT INTO tasks (id, mind_id, type, description, status, event_id, created_at, updated_at)
+     VALUES ($1, $2, $3, $4, 'running', $5, $6, $6)`,
+    [taskId, "repository", "github.ci.failed", "Worker failure callback test", eventId, startedAt]
   );
-  
-  if (executions.rows.length > 0 && executions.rows[0].status === "running") {
-    await query(
-      "UPDATE executions SET status = 'failed', error = $1, completed_at = $2 WHERE id = $3",
-      ["Worker disappeared (simulated)", new Date(), executions.rows[0].id]
-    );
-    await query(
-      "UPDATE tasks SET status = 'failed', error = $1, updated_at = $2 WHERE id = $3",
-      ["Worker failed: Worker disappeared (simulated)", new Date(), task.rows[0].id]
-    );
-    await query(
-      "UPDATE minds SET state = 'failed', updated_at = NOW() WHERE id = 'repository'"
-    );
+  await query(
+    `INSERT INTO executions (id, task_id, provider, status, started_at)
+     VALUES ($1, $2, 'github-worker', 'running', $3)`,
+    [executionId, taskId, startedAt]
+  );
+  await query("UPDATE minds SET state = 'working', updated_at = $1 WHERE id = 'repository'", [startedAt]);
+
+  const callback = await reportWorkerFailure(executionId, taskId, failure);
+  if (!callback.ok) {
+    throw new Error(`Worker failure callback returned ${callback.status}: ${await callback.text()}`);
   }
-  
-  await new Promise(r => setTimeout(r, 1000));
-  
-  // Mind should transition to failed then (on next event) to sleeping
-  // Let's verify it's in failed state
-  const mindResult = await query("SELECT state FROM minds WHERE id = 'repository'");
-  console.log(`Mind state after worker failure: ${mindResult.rows[0].state}`);
-  
-  // Now send another event to verify it recovers to sleeping
-  const newRunId = await createBrokenWorkflow();
-  const newRun = await waitForWorkflowRun(newRunId);
-  
-  const newPayload = {
-    action: "completed",
-    workflow_run: {
-      id: newRun.id,
-      name: newRun.name,
-      head_branch: newRun.head_branch,
-      head_sha: newRun.head_sha,
-      conclusion: newRun.conclusion,
-      status: newRun.status,
-      html_url: newRun.html_url,
-      repository: { full_name: `${env.GITHUB_OWNER}/${env.GITHUB_REPO}` }
-    },
-    repository: { full_name: `${env.GITHUB_OWNER}/${env.GITHUB_REPO}` }
-  };
-  await sendWebhook("workflow_run", newPayload, `test-delivery-${Date.now()}`);
-  
-  const newEvent = await waitForEventInDB("github.ci.failed", { runId: newRun.id });
-  const newTask = await waitForTaskCompletion(newEvent.id);
-  
-  if (newTask.status !== "completed") {
-    throw new Error(`New task failed after worker failure: ${newTask.error}`);
+
+  const outcome = await query<{
+    task_status: string;
+    task_error: string;
+    execution_status: string;
+    execution_error: string;
+    event_processed: boolean;
+    mind_state: string;
+  }>(
+    `SELECT t.status AS task_status, t.error AS task_error,
+            x.status AS execution_status, x.error AS execution_error,
+            e.processed AS event_processed, m.state AS mind_state
+     FROM tasks t
+     JOIN executions x ON x.task_id = t.id
+     JOIN events e ON e.id = t.event_id
+     JOIN minds m ON m.id = t.mind_id
+     WHERE t.id = $1`,
+    [taskId]
+  );
+  const result = outcome.rows[0];
+  if (result.task_status !== "failed" || result.task_error !== failure ||
+      result.execution_status !== "failed" || result.execution_error !== failure ||
+      !result.event_processed || result.mind_state !== "sleeping") {
+    throw new Error(`Failure callback persisted unexpected state: ${JSON.stringify(result)}`);
   }
-  
+
   await verifyMindSleeping();
-  console.log("✓ Scenario 5 PASSED (mind survives worker failure)");
+  console.log("✓ Scenario 5 PASSED (failure callback persisted and Mind returned to sleep)");
 }
 
 async function runScenario6_ApprovalFlow() {
@@ -757,10 +741,12 @@ async function main() {
     if (!phase3Only) {
       await runScenario4_Recovery();
       results["Recovery"] = true;
+    }
 
-      await runScenario5_WorkerFailure();
-      results["Worker Failure"] = true;
+    await runScenario5_WorkerFailure();
+    results["Worker Failure Callback"] = true;
 
+    if (!phase3Only) {
       await runScenario6_ApprovalFlow();
       results["Approval Flow"] = true;
 
