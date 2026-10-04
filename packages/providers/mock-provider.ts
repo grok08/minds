@@ -1,8 +1,13 @@
-import { AgentProvider } from "./provider.ts";
-import { Task, Execution } from "../runtime/src/domain/types.ts";
+import type { AgentProvider } from "./provider.ts";
+import type { Task, Execution } from "../runtime/src/domain/types.ts";
+import type { MemoryContextEntry } from "../memory/src/types.ts";
 
 export class MockProvider implements AgentProvider {
-  async start(task: Task, execution: Execution): Promise<Execution> {
+  async start(
+    task: Task,
+    execution: Execution,
+    _memoryContext: MemoryContextEntry[]
+  ): Promise<Execution> {
     execution.status = "completed";
     execution.result = `Mock execution completed for task: ${task.description}`;
     execution.startedAt = new Date();

@@ -3,6 +3,8 @@ import { createServer as createTcpServer } from "node:net";
 import { randomUUID } from "node:crypto";
 import { afterAll, expect, test } from "bun:test";
 import { closePool, query } from "../../packages/db/src/client.ts";
+import { PersistentMindRuntime } from "../../packages/runtime/src/runtime.ts";
+import { createMockProvider } from "../../packages/providers/mock-provider.ts";
 
 const TEST_MIND_ID = `test-server-restart-${randomUUID()}`;
 const TEST_EVENT_ID = `test-server-restart-event-${randomUUID()}`;
@@ -107,6 +109,12 @@ test("server restart recovers persisted running work", async () => {
   try {
     serverProcess = startServer(port);
     await waitForServer(serverProcess, port);
+
+    const memoryRuntime = new PersistentMindRuntime(TEST_MIND_ID, createMockProvider());
+    await memoryRuntime.initialize();
+    await memoryRuntime.remember("fact", {
+      statement: "This memory must remain after the server restarts.",
+    });
 
     const mindResponse = await fetch(`http://127.0.0.1:${port}/minds/${TEST_MIND_ID}`);
     expect(mindResponse.status).toBe(200);
@@ -231,6 +239,14 @@ test("server restart recovers persisted running work", async () => {
     expect(recoveredMindResponse.status).toBe(200);
     const recoveredMind = await recoveredMindResponse.json();
     expect(recoveredMind.state).toBe("sleeping");
+
+    const restartedMemoryRuntime = new PersistentMindRuntime(TEST_MIND_ID, createMockProvider());
+    await restartedMemoryRuntime.initialize();
+    const restartedMemory = await restartedMemoryRuntime.getMemory();
+    expect(restartedMemory).toContainEqual(expect.objectContaining({
+      type: "fact",
+      content: { statement: "This memory must remain after the server restarts." },
+    }));
 
     const recoveredTaskResponse = await fetch(`http://127.0.0.1:${port}/tasks/${TEST_TASK_ID}`);
     expect(recoveredTaskResponse.status).toBe(200);

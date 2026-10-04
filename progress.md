@@ -2,7 +2,7 @@
 
 Status snapshot: 2026-10-04
 
-Minds is an early prototype. The current code covers the lifecycle, durable storage, core GitHub event path, a disposable GitHub Actions worker with polling and timeout recovery, and human-in-the-loop approval workflow. The MVP in `PLAN.md` is not complete.
+Minds is an early prototype. The current code covers the lifecycle, durable storage, core GitHub event path, a disposable GitHub Actions worker with polling and timeout recovery, human-in-the-loop approval, and structured Mind memory. The MVP in `PLAN.md` is not complete.
 
 ## Completed
 
@@ -41,14 +41,22 @@ Minds is an early prototype. The current code covers the lifecycle, durable stor
   - Added task approval payload/timestamp fields and approval decision/continuation fields in migration 003.
   - Startup recovery keeps a task and Mind in `waiting` while a pending approval exists. Approval after restart resumes the task.
   - Added tests for worker approval requests and continuation, callback retries, approval/rejection idempotency, invalid transitions, and restart-and-resume behavior.
+- **Phase 5: Implemented structured, Mind-owned memory.**
+  - Added typed memory records for facts, actions, decisions, repository knowledge, and task outcomes. The runtime scopes all memory reads and writes to its Mind.
+  - Added runtime `remember()` and `getMemory()` operations on the existing PostgreSQL `memory` table.
+  - Recorded completed, failed, and rejected task outcomes with the task's terminal state. Outcome writes share the task-state transaction and use a stable task-based ID to avoid duplicate records.
+  - Loaded the latest bounded memory context before worker dispatch and passed it as read-only `memory_context` input through GitHub Actions. The worker validates the input before task execution.
+  - Added tests for structured memory, task outcomes, worker context dispatch, runtime restart persistence, and malformed memory context.
 
 ## Verification
 
 - 2026-10-04: After Phase 4 changes, `bun run tsc --noEmit`, `git diff --check`, and `bun test tests/unit/` passed. The 41 unit tests ran across 4 files. Runtime tests used a temporary isolated PostgreSQL database with migrations 001-003 applied; the database was removed after each run.
 - 2026-10-04: `bun test tests/integration/server-restart.test.ts` passed. Started server, persisted running work under unique Mind ID, killed server process, restarted it, verified recovered Mind, task, execution, and event state.
+- 2026-10-04: Phase 5 `bun run tsc --noEmit`, `git diff --check`, and focused memory/worker tests passed. Runtime tests passed (23 tests) and the server restart test passed (1 test) against a temporary isolated PostgreSQL database with migrations 001-003; the database was removed.
+- 2026-10-04: Live Phase 4 approval/resume verification passed against `grok08/minds-test-repo`. The task entered `waiting`, was approved, and completed; GitHub Actions runs `37215687007` and `37215867009` both succeeded.
 - 2026-10-04: `git diff --check` passed.
 - Phase 4 unit tests cover: approval request → waiting → approval → continuation → completion; rejection; invalid transitions; idempotency; restart recovery preserving waiting tasks; duplicate approval/rejection idempotency.
-- The Phase 4 unit run did not dispatch a live GitHub Actions worker or exercise an externally hosted callback. The callback, workflow inputs, and worker behavior were covered by local tests.
+- Phase 5 passes memory context to the worker. The current deterministic worker handlers do not yet use that context to change their results.
 - Not rerun in this snapshot: API server tests or the live GitHub integration script. Port 3000 was already in use, so the existing server was left untouched. API tests also need a configured server and webhook secret; live GitHub tests need an authorized disposable test repository.
 - Historical live GitHub integration: the user reports that the configured repository was used and the integration tests were run. The date and pass/fail output are not recorded in the available project notes or session history, so this is not counted as a fresh verified run.
 - 2026-10-04: A user-provided GitHub settings screenshot shows a webhook configured for `aichemy/minds-test-repo`, subscribed to pull request, push, and workflow events. GitHub reports that its last delivery was successful. The screenshot does not show the delivery details or confirm the corresponding persisted event and task.
@@ -59,8 +67,8 @@ Minds is an early prototype. The current code covers the lifecycle, durable stor
 - Phase 0's basic lifecycle is demonstrated, but the demo uses PostgreSQL. The plan specifies an in-memory spike.
 - Phase 1 persists lifecycle data and detects incomplete tasks. Startup recovery atomically marks interrupted events, tasks, and executions terminal, then returns the Mind to `sleeping` so it can accept new events. The PostgreSQL runtime tests and server process kill-and-restart test pass. The server test seeds persisted running state while the process is alive; it does not interrupt an executing worker. The recovery scenario in `tests/integration/github.integration.ts` edits database rows directly and does not kill or restart the server.
 - Phase 2 has webhook handling, repository configuration, event mapping, and GitHub API calls. `tests/integration/github.integration.ts` covers CI failure, PR-opened processing, and duplicate-delivery idempotency by posting signed webhook payloads directly to the server. It creates or updates a real workflow and pull request through GitHub's API, but those webhook payloads are simulated rather than captured from GitHub delivery records. `bun run verify:webhook-correlation` separately verified one actual `workflow_run.completed` delivery through event, task, and execution persistence.
-- Phase 4 is implemented and locally verified. The local tests cover the worker request/continuation protocol and durable runtime lifecycle. A live GitHub Actions approval round trip remains unverified.
-- Phase 5 is not implemented beyond the database table. There is no memory read/write behavior in the runtime.
+- Phase 4 is implemented and verified locally and through a live GitHub Actions approval round trip.
+- Phase 5 memory storage, retrieval, task outcome recording, and worker context dispatch are implemented. The worker handlers do not yet reason over memory.
 - Phase 6 has no timer or scheduler.
 - Phase 7 has no web UI.
 - Phase 8 is not implemented. The runtime accepts a Mind ID, but the server initializes only the hard-coded `repository` Mind.
@@ -72,8 +80,8 @@ Minds is an early prototype. The current code covers the lifecycle, durable stor
 Complete these in order. Keep later phases out of scope until their prerequisites work.
 
 1. **Maintain Phase 2 verification.** Keep the existing PR-opened and duplicate-delivery integration scenarios. The real webhook correlation command can also confirm an actual PR delivery when one exists in GitHub's delivery history. Rerun the full GitHub integration script only when its side effects are authorized and the configured repository is disposable.
-2. **Phase 4 is complete and locally verified.** Human-in-the-loop approval workflow has durable waiting state, atomic approval/rejection, continuation execution, and restart recovery. A live GitHub Actions approval round trip remains unverified.
-3. **Implement Phase 5.** Add structured, Mind-owned memory operations and tests for persistence across runtime restarts.
+2. **Phase 4 is complete and verified locally and through live GitHub Actions.** Human-in-the-loop approval has durable waiting state, atomic approval/rejection, continuation execution, and restart recovery.
+3. **Phase 5 is implemented and locally verified.** Structured memory is Mind-owned and survives runtime restarts. The current worker handlers do not yet use memory to change their results.
 4. **Implement Phase 6.** Add scheduled wake-ups only after event-driven wake and recovery work reliably.
 5. **Implement Phase 7.** Add the minimal observability and control UI described in `PLAN.md`.
 6. **Consider Phases 8 and 9.** Add multiple Minds and providers only after the single-Mind runtime and first worker are stable.

@@ -23,6 +23,11 @@ on:
         required: false
         type: string
         default: "{}"
+      memory_context:
+        description: "Read-only memory context for the task"
+        required: false
+        type: string
+        default: "[]"
       minds_server_url:
         description: "Minds server URL for callback"
         required: true
@@ -60,6 +65,7 @@ jobs:
           EVENT_TYPE: ${{ github.event.inputs.event_type }}
           PAYLOAD: ${{ github.event.inputs.payload }}
           APPROVAL_PAYLOAD: ${{ github.event.inputs.approval_payload }}
+          MEMORY_CONTEXT: ${{ github.event.inputs.memory_context }}
           MINDS_SERVER_URL: ${{ github.event.inputs.minds_server_url }}
           MINDS_CALLBACK_SECRET: ${{ secrets.MINDS_CALLBACK_SECRET }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

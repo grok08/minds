@@ -1,5 +1,7 @@
 import { Octokit } from "@octokit/rest";
-import { GitHubEventPayload } from "../../runtime/src/domain/types.ts";
+import type { GitHubEventPayload } from "../../runtime/src/domain/types.ts";
+import { parseMemoryContext } from "../../memory/src/types.ts";
+import type { MemoryContextEntry } from "../../memory/src/types.ts";
 
 interface WorkerEnv {
   TASK_ID: string;
@@ -7,6 +9,7 @@ interface WorkerEnv {
   EVENT_TYPE: string;
   PAYLOAD: string;
   APPROVAL_PAYLOAD: string;
+  MEMORY_CONTEXT: string;
   MINDS_SERVER_URL: string;
   MINDS_CALLBACK_SECRET: string;
   GITHUB_TOKEN: string;
@@ -42,6 +45,7 @@ function getEnv(): WorkerEnv {
     env[key] = value;
   }
   env.APPROVAL_PAYLOAD = process.env.APPROVAL_PAYLOAD ?? "{}";
+  env.MEMORY_CONTEXT = process.env.MEMORY_CONTEXT ?? "[]";
   return env as unknown as WorkerEnv;
 }
 
@@ -201,6 +205,7 @@ export async function executeWorkerTask(input: {
   eventType: string;
   payload: GitHubEventPayload;
   approvalPayload?: Record<string, unknown>;
+  memoryContext?: MemoryContextEntry[];
   octokit: Octokit;
   owner: string;
   repo: string;
@@ -255,10 +260,12 @@ async function main() {
   }
 
   const outcome = await executeAndReport(async () => {
+    const memoryContext = parseMemoryContext(JSON.parse(env.MEMORY_CONTEXT));
     return executeWorkerTask({
       eventType: env.EVENT_TYPE,
       payload,
       approvalPayload,
+      memoryContext,
       octokit,
       owner,
       repo,

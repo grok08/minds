@@ -4,6 +4,7 @@ import { PersistentMindRuntime } from "../../packages/runtime/src/runtime.ts";
 import { generateId } from "../../packages/runtime/src/domain/types.ts";
 import { createMockProvider } from "../../packages/providers/mock-provider.ts";
 import { query, closePool } from "../../packages/db/src/client.ts";
+import type { MemoryContextEntry } from "../../packages/memory/src/types.ts";
 
 const TEST_MIND_ID = `test-repository-${randomUUID()}`;
 
@@ -49,6 +50,72 @@ describe("PersistentMindRuntime", () => {
     expect(snapshot.tasks[0].status).toBe("completed");
     expect(snapshot.executions).toHaveLength(1);
     expect(snapshot.executions[0].status).toBe("completed");
+  });
+
+  test("fails a synchronous execution without a result and records its outcome", async () => {
+    runtime = new PersistentMindRuntime(TEST_MIND_ID, {
+      start: async (_task, execution) => ({
+        ...execution,
+        status: "completed",
+        result: "",
+      }),
+      status: async (execution) => execution.status,
+      stop: async () => {},
+    });
+    await runtime.initialize();
+
+    await runtime.handleEvent({
+      id: generateId("test-empty-result"),
+      type: "demo.requested",
+      payload: "Return an empty result",
+    });
+
+    const snapshot = await runtime.snapshot();
+    expect(snapshot.tasks[0].status).toBe("failed");
+    expect(snapshot.tasks[0].error).toBe("Worker completed without a result");
+    expect(runtime.getMindState()).toBe("failed");
+    expect((await runtime.getMemory()).find((entry) => entry.type === "task_outcome")?.content)
+      .toEqual({
+        taskId: snapshot.tasks[0].id,
+        status: "failed",
+        error: "Worker completed without a result",
+      });
+  });
+
+  test("stores Mind memory, sends it to the worker, and reloads it after runtime restart", async () => {
+    let receivedMemory: MemoryContextEntry[] = [];
+    runtime = new PersistentMindRuntime(TEST_MIND_ID, {
+      start: async (_task, execution, memoryContext) => {
+        receivedMemory = memoryContext;
+        execution.status = "completed";
+        execution.result = "Completed with Mind memory";
+        return execution;
+      },
+      status: async (execution) => execution.status,
+      stop: async () => {},
+    });
+    await runtime.initialize();
+
+    await runtime.remember("fact", { statement: "The repository uses Bun." });
+    await runtime.handleEvent({
+      id: generateId("test-memory-context"),
+      type: "demo.requested",
+      payload: "Use stored repository knowledge",
+    });
+
+    expect(receivedMemory).toEqual([{
+      type: "fact",
+      content: { statement: "The repository uses Bun." },
+    }]);
+
+    const persistedMemory = await runtime.getMemory();
+    expect(persistedMemory).toHaveLength(2);
+    expect(persistedMemory[1].type).toBe("task_outcome");
+    expect(persistedMemory[1].content.status).toBe("completed");
+
+    const restartedRuntime = new PersistentMindRuntime(TEST_MIND_ID, createMockProvider());
+    await restartedRuntime.initialize();
+    expect(await restartedRuntime.getMemory()).toEqual(persistedMemory);
   });
 
   test("records a worker result once and synchronizes runtime state", async () => {
@@ -102,6 +169,14 @@ describe("PersistentMindRuntime", () => {
     expect(completedExecution.status).toBe("completed");
     expect(completedExecution.result).toBe("Worker completed the CI investigation");
     expect(event.rows[0].processed).toBe(true);
+
+    const outcomes = (await runtime.getMemory()).filter((entry) => entry.type === "task_outcome");
+    expect(outcomes).toHaveLength(1);
+    expect(outcomes[0].content).toEqual({
+      taskId: runningTask.id,
+      status: "completed",
+      result: "Worker completed the CI investigation",
+    });
   });
 
   test("records a failed worker result and leaves the Mind able to accept another event", async () => {
@@ -136,6 +211,12 @@ describe("PersistentMindRuntime", () => {
     expect(failedSnapshot.tasks[0].error).toBe("Worker process exited unsuccessfully");
     expect(failedSnapshot.executions[0].status).toBe("failed");
     expect(failedSnapshot.executions[0].error).toBe("Worker process exited unsuccessfully");
+    expect((await runtime.getMemory()).filter((entry) => entry.type === "task_outcome")[0].content)
+      .toEqual({
+        taskId: runningTask.id,
+        status: "failed",
+        error: "Worker process exited unsuccessfully",
+      });
 
     await runtime.handleEvent({
       id: generateId("test-event-after-worker-failure"),
@@ -727,6 +808,15 @@ describe("PersistentMindRuntime", () => {
     expect(approvals.rows[0].status).toBe("rejected");
     expect(approvals.rows[0].decision).toBe("rejected");
     expect(approvals.rows[0].decided_at).toBeDefined();
+
+    const memoryOutcomes = (await runtime.getMemory())
+      .filter((entry) => entry.type === "task_outcome");
+    expect(memoryOutcomes).toHaveLength(1);
+    expect(memoryOutcomes[0].content).toEqual({
+      taskId: runningTask.id,
+      status: "rejected",
+      error: "Rejected by human",
+    });
 
     // Event should be processed
     const event = await query<{ processed: boolean }>(

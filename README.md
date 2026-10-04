@@ -8,7 +8,7 @@ The Mind persists beyond any one task or worker execution. Workers are disposabl
 
 The first MVP uses one Repository Mind whose purpose is to keep a GitHub repository healthy. GitHub is the first external environment, not the definition of a Mind. The MVP tests whether a persistent Mind can react to events, execute durable tasks, wait for approval, resume, preserve its history, and recover after the runtime restarts.
 
-The current prototype stores runtime data in PostgreSQL. Phase 3, the disposable GitHub Actions worker, and Phase 4, durable human approval and resume, are implemented and locally verified. A live GitHub Actions approval round trip remains unverified, so the MVP is not complete. See [progress.md](progress.md) for current status and verification results.
+The current prototype stores runtime data in PostgreSQL. Phases 3–5 are implemented and locally verified. A live GitHub Actions approval round trip also passed. The MVP is not complete. See [progress.md](progress.md) for current status and verification results.
 
 ## Mind and worker responsibilities
 
@@ -35,10 +35,17 @@ To submit a user message, send `POST /messages` with a non-empty `message`. Set 
 
 The prototype API does not authenticate user message or approval requests. Do not expose these routes to untrusted networks.
 
+## Mind memory
+
+The runtime stores structured memory records by Mind. Call `remember(type, content)` to add a fact, action, decision, or repository knowledge. The runtime also records completed, failed, and rejected task outcomes. Call `getMemory(limit)` to read a Mind's records.
+
+Before each worker execution, the runtime sends the latest bounded memory context as read-only workflow input. Workers do not write to the memory table. Memory uses PostgreSQL's existing `memory` table. This phase does not add embeddings or semantic search.
+
 ## Repository layout
 
 - `apps/cli` contains the mock-provider demo.
 - `apps/server` contains the Fastify server.
+- `packages/memory` owns structured Mind memory and worker context.
 - `packages/runtime` owns the Mind lifecycle, task orchestration, polling, and recovery.
 - `packages/github` verifies and maps GitHub webhook events.
 - `packages/providers` contains the mock and GitHub Actions worker providers.
@@ -135,4 +142,4 @@ bun run test:integration
 
 The repository table currently stores the GitHub token and webhook secret in PostgreSQL. Do not use production credentials with this prototype. Define protected credential storage before deploying Minds for production use.
 
-The runtime currently initializes one Repository Mind. Durable approval and resume behavior, structured memory operations, scheduling, and a user interface are not complete. See [PLAN.md](PLAN.md) for MVP scope and [progress.md](progress.md) for implementation details.
+The runtime currently initializes one Repository Mind. Scheduling and a user interface are not complete. The GitHub worker receives memory context, but its current deterministic task handlers do not use the context to change their results. See [PLAN.md](PLAN.md) for MVP scope and [progress.md](progress.md) for implementation details.

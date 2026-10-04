@@ -16,6 +16,8 @@ import {
   toExecution,
 } from "./domain/types.ts";
 import { AgentProvider, ExecutionStatus } from "../../providers/provider.ts";
+import { MindMemoryStore } from "../../memory/src/memory.ts";
+import type { MemoryContent, MemoryEntry, MemoryType } from "../../memory/src/types.ts";
 
 export interface PollingConfig {
   intervalMs: number;
@@ -25,6 +27,7 @@ export interface PollingConfig {
 
 export class PersistentMindRuntime {
   private readonly mindId: string;
+  private readonly memory: MindMemoryStore;
   private mind: Mind | null = null;
   private readonly provider: AgentProvider;
   private readonly pollingConfig: PollingConfig;
@@ -40,6 +43,7 @@ export class PersistentMindRuntime {
     pollingConfig: Partial<PollingConfig> = {}
   ) {
     this.mindId = mindId;
+    this.memory = new MindMemoryStore(mindId);
     this.provider = provider;
     this.pollingConfig = {
       intervalMs: pollingConfig.intervalMs ?? 10000,
@@ -51,6 +55,20 @@ export class PersistentMindRuntime {
   async initialize(): Promise<void> {
     await this.ensureMindExists();
     await this.recoverState();
+  }
+
+  async remember(type: MemoryType, content: MemoryContent): Promise<MemoryEntry> {
+    if (!this.mind) {
+      throw new Error("Runtime not initialized");
+    }
+    return this.memory.remember(type, content);
+  }
+
+  async getMemory(limit?: number): Promise<MemoryEntry[]> {
+    if (!this.mind) {
+      throw new Error("Runtime not initialized");
+    }
+    return this.memory.list(limit);
   }
 
   private async ensureMindExists(): Promise<void> {
@@ -219,7 +237,8 @@ export class PersistentMindRuntime {
     await this.persistExecution(execution);
 
     try {
-      const providerExecution = await this.provider.start(task, execution);
+      const memoryContext = await this.memory.loadWorkerContext();
+      const providerExecution = await this.provider.start(task, execution, memoryContext);
       
       if (providerExecution.workflowRunId) {
         await query(
@@ -228,32 +247,35 @@ export class PersistentMindRuntime {
         );
       }
       
-      if (providerExecution.status === "completed" && providerExecution.result) {
-        await this.completeTask(task.id, providerExecution.result);
-        await this.completeExecution(execution.id, providerExecution.result);
-        await this.transitionState("sleeping");
-      } else if (providerExecution.status === "failed" && providerExecution.error) {
-        await this.failTask(task.id, providerExecution.error);
-        await this.failExecution(execution.id, providerExecution.error);
-        await this.transitionState("failed");
+      if (providerExecution.status === "completed") {
+        await this.recordExecutionResult({
+          executionId: execution.id,
+          taskId: task.id,
+          status: providerExecution.result ? "completed" : "failed",
+          result: providerExecution.result,
+          error: providerExecution.result ? undefined : "Worker completed without a result",
+          failureMindState: "failed",
+        });
+      } else if (providerExecution.status === "failed") {
+        await this.recordExecutionResult({
+          executionId: execution.id,
+          taskId: task.id,
+          status: "failed",
+          error: providerExecution.error ?? "Worker failed",
+          failureMindState: "failed",
+        });
+      } else {
+        await query("UPDATE events SET processed = true WHERE id = $1", [eventId]);
       }
-      
-      await query(
-        "UPDATE events SET processed = true WHERE id = $1",
-        [eventId]
-      );
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      
-      await this.failTask(task.id, message);
-      await this.failExecution(execution.id, message);
-      await this.transitionState("failed");
-      
-      await query(
-        "UPDATE events SET processed = true WHERE id = $1",
-        [eventId]
-      );
-      
+      await this.recordExecutionResult({
+        executionId: execution.id,
+        taskId: task.id,
+        status: "failed",
+        error: message,
+        failureMindState: "failed",
+      });
       throw error;
     }
   }
@@ -279,38 +301,6 @@ export class PersistentMindRuntime {
       `INSERT INTO executions (id, task_id, provider, status, started_at, workflow_run_id)
        VALUES ($1, $2, $3, $4, $5, $6)`,
       [execution.id, execution.taskId, execution.provider, execution.status, execution.startedAt, execution.workflowRunId ?? null]
-    );
-  }
-
-  private async completeTask(taskId: string, result: string): Promise<void> {
-    const now = new Date();
-    await query(
-      `UPDATE tasks SET status = 'completed', result = $1, updated_at = $2 WHERE id = $3`,
-      [result, now, taskId]
-    );
-  }
-
-  private async failTask(taskId: string, error: string): Promise<void> {
-    const now = new Date();
-    await query(
-      `UPDATE tasks SET status = 'failed', error = $1, updated_at = $2 WHERE id = $3`,
-      [error, now, taskId]
-    );
-  }
-
-  private async completeExecution(executionId: string, result: string): Promise<void> {
-    const now = new Date();
-    await query(
-      `UPDATE executions SET status = 'completed', result = $1, completed_at = $2 WHERE id = $3`,
-      [result, now, executionId]
-    );
-  }
-
-  private async failExecution(executionId: string, error: string): Promise<void> {
-    const now = new Date();
-    await query(
-      `UPDATE executions SET status = 'failed', error = $1, completed_at = $2 WHERE id = $3`,
-      [error, now, executionId]
     );
   }
 
@@ -376,6 +366,7 @@ export class PersistentMindRuntime {
     status: "completed" | "failed";
     result?: string;
     error?: string;
+    failureMindState?: "sleeping" | "failed";
   }): Promise<void> {
     if (!this.mind) {
       throw new Error("Runtime not initialized");
@@ -444,17 +435,32 @@ export class PersistentMindRuntime {
         );
       }
 
+      await this.memory.recordTaskOutcome(client, {
+        taskId: input.taskId,
+        status: input.status,
+        result: input.status === "completed" ? result ?? undefined : undefined,
+        error: input.status === "failed" ? error ?? undefined : undefined,
+      });
+
       await client.query("UPDATE events SET processed = true WHERE id = $1", [execution.event_id]);
 
-      if (execution.mind_state !== "sleeping") {
+      const nextMindState =
+        input.status === "failed" ? input.failureMindState ?? "sleeping" : "sleeping";
+      if (execution.mind_state !== nextMindState) {
         await client.query(
-          "UPDATE minds SET state = 'sleeping', updated_at = $1 WHERE id = $2",
-          [now, execution.mind_id]
+          "UPDATE minds SET state = $1, updated_at = $2 WHERE id = $3",
+          [nextMindState, now, execution.mind_id]
         );
         await client.query(
           `INSERT INTO state_transitions (id, mind_id, from_state, to_state, created_at)
            VALUES ($1, $2, $3, $4, $5)`,
-          [generateId("transition"), execution.mind_id, execution.mind_state, "sleeping", now]
+          [
+            generateId("transition"),
+            execution.mind_id,
+            execution.mind_state,
+            nextMindState,
+            now,
+          ]
         );
       }
     });
@@ -666,7 +672,12 @@ export class PersistentMindRuntime {
     if (!continuation) return;
 
     try {
-      const providerExecution = await this.provider.start(continuation.task, continuation.execution);
+      const memoryContext = await this.memory.loadWorkerContext();
+      const providerExecution = await this.provider.start(
+        continuation.task,
+        continuation.execution,
+        memoryContext
+      );
       if (providerExecution.workflowRunId) {
         await this.registerWorkflowRunId({
           executionId: continuation.execution.id,
@@ -778,6 +789,11 @@ export class PersistentMindRuntime {
         `UPDATE tasks SET status = 'failed', error = 'Rejected by human', updated_at = $1 WHERE id = $2`,
         [now, taskId]
       );
+      await this.memory.recordTaskOutcome(client, {
+        taskId,
+        status: "rejected",
+        error: "Rejected by human",
+      });
       await client.query(
         `UPDATE minds SET state = 'sleeping', updated_at = $1 WHERE id = $2`,
         [now, this.mindId]

@@ -6,7 +6,8 @@ import {
   executeWorkerTask,
   type WorkerOutcome,
 } from "../../packages/providers/github-worker/worker.ts";
-import { Execution, Task } from "../../packages/runtime/src/domain/types.ts";
+import type { Execution, Task } from "../../packages/runtime/src/domain/types.ts";
+import type { MemoryContextEntry } from "../../packages/memory/src/types.ts";
 
 const eventPayload = {
   runId: 12345,
@@ -60,7 +61,7 @@ describe("GitHubWorkerProvider", () => {
       dispatches.push([workflowFile, payload]);
     });
 
-    const execution = await provider.start(makeTask(), makeExecution());
+    const execution = await provider.start(makeTask(), makeExecution(), []);
 
     expect(dispatches).toEqual([[
       "minds-worker.yml",
@@ -71,6 +72,7 @@ describe("GitHubWorkerProvider", () => {
           execution_id: "execution-phase3",
           event_type: "github.ci.failed",
           payload: JSON.stringify(eventPayload),
+          memory_context: "[]",
           minds_server_url: "https://minds.example.test",
         },
       },
@@ -84,7 +86,7 @@ describe("GitHubWorkerProvider", () => {
       throw new Error("GitHub dispatch failed");
     });
 
-    await expect(provider.start(makeTask(), makeExecution())).rejects.toThrow("GitHub dispatch failed");
+    await expect(provider.start(makeTask(), makeExecution(), [])).rejects.toThrow("GitHub dispatch failed");
   });
 
   test("dispatches persisted approval context for continuation executions", async () => {
@@ -97,11 +99,26 @@ describe("GitHubWorkerProvider", () => {
       approvalPayload: { action: "continue_user_message", message: "prepare a fix" },
     };
 
-    await provider.start(task, makeExecution());
+    await provider.start(task, makeExecution(), []);
 
     expect(dispatches[0].inputs.approval_payload).toBe(JSON.stringify(task.approvalPayload));
     expect(dispatches[0].inputs.event_type).toBe("github.ci.failed");
     expect(dispatches[0].inputs.payload).toBe(JSON.stringify(eventPayload));
+  });
+
+  test("dispatches bounded Mind memory as read-only worker context", async () => {
+    const dispatches: Array<{ ref: string; inputs: Record<string, string> }> = [];
+    const provider = makeProvider(async (_workflowFile, payload) => {
+      dispatches.push(payload);
+    });
+    const memoryContext: MemoryContextEntry[] = [{
+      type: "fact",
+      content: { statement: "The project uses Bun." },
+    }];
+
+    await provider.start(makeTask(), makeExecution(), memoryContext);
+
+    expect(dispatches[0].inputs.memory_context).toBe(JSON.stringify(memoryContext));
   });
 
   test("worker requests approval and continues the same user task after approval", async () => {

@@ -1,5 +1,6 @@
-import { AgentProvider, ExecutionStatus } from "../provider.ts";
-import { Task, Execution, GitHubEventPayload } from "../../runtime/src/domain/types.ts";
+import type { AgentProvider, ExecutionStatus } from "../provider.ts";
+import type { Task, Execution, GitHubEventPayload } from "../../runtime/src/domain/types.ts";
+import type { MemoryContextEntry } from "../../memory/src/types.ts";
 import { createGitHubClient, GitHubClient, GitHubConfig } from "../../github/src/client.ts";
 
 export interface GitHubWorkerConfig {
@@ -25,12 +26,16 @@ export class GitHubWorkerProvider implements AgentProvider {
     this.mindsCallbackSecret = config.mindsCallbackSecret;
   }
 
-  async start(task: Task, execution: Execution): Promise<Execution> {
+  async start(
+    task: Task,
+    execution: Execution,
+    memoryContext: MemoryContextEntry[]
+  ): Promise<Execution> {
     execution.status = "running";
     execution.startedAt = new Date();
 
     const payload = this.parsePayload(task);
-    await this.dispatchWorkflow(task, execution, payload);
+    await this.dispatchWorkflow(task, execution, payload, memoryContext);
     execution.status = "running";
     
     return execution;
@@ -90,7 +95,8 @@ export class GitHubWorkerProvider implements AgentProvider {
   private async dispatchWorkflow(
     task: Task,
     execution: Execution,
-    payload: GitHubEventPayload
+    payload: GitHubEventPayload,
+    memoryContext: MemoryContextEntry[]
   ): Promise<void> {
     const dispatchPayload = {
       ref: "main",
@@ -99,6 +105,7 @@ export class GitHubWorkerProvider implements AgentProvider {
         execution_id: execution.id,
         event_type: task.type,
         payload: JSON.stringify(payload),
+        memory_context: JSON.stringify(memoryContext),
         minds_server_url: this.mindsServerUrl,
         ...(task.approvalPayload
           ? { approval_payload: JSON.stringify(task.approvalPayload) }
