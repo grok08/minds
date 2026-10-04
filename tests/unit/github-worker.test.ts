@@ -115,6 +115,16 @@ describe("GitHubWorkerProvider", () => {
       repo: "test-repo",
     });
 
+    const emptyContext = await executeWorkerTask({
+      eventType: "user.message",
+      payload,
+      approvalPayload: {},
+      octokit,
+      owner: "test-owner",
+      repo: "test-repo",
+    });
+    expect(emptyContext).toEqual(requested);
+
     expect(requested).toEqual({
       status: "approval_required",
       approvalPayload: {

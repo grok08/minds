@@ -177,7 +177,7 @@ function continueUserMessage(
   payload: GitHubEventPayload,
   approvalPayload?: Record<string, unknown>
 ): WorkerTaskResult {
-  if (approvalPayload) {
+  if (approvalPayload && Object.keys(approvalPayload).length > 0) {
     if (approvalPayload.action !== "continue_user_message") {
       throw new Error("Unsupported approved continuation action");
     }
