@@ -1,0 +1,114 @@
+import { AgentProvider, ExecutionStatus } from "../provider.ts";
+import { Task, Execution, GitHubEventPayload } from "../../runtime/src/domain/types.ts";
+import { createGitHubClient, GitHubClient, GitHubConfig } from "../../github/src/client.ts";
+
+export interface GitHubWorkerConfig {
+  github: GitHubConfig;
+  mindsServerUrl: string;
+  mindsCallbackSecret: string;
+}
+
+interface GitHubWorkerClient {
+  dispatchWorkflow(workflowFile: string, payload: { ref: string; inputs: Record<string, string> }): Promise<void>;
+  getWorkflowRun(runId: number): Promise<{ status: string | null; conclusion: string | null }>;
+  cancelWorkflowRun(runId: number): Promise<void>;
+}
+
+export class GitHubWorkerProvider implements AgentProvider {
+  private readonly githubClient: GitHubWorkerClient;
+  private readonly mindsServerUrl: string;
+  private readonly mindsCallbackSecret: string;
+
+  constructor(config: GitHubWorkerConfig, githubClient: GitHubWorkerClient = createGitHubClient(config.github)) {
+    this.githubClient = githubClient;
+    this.mindsServerUrl = config.mindsServerUrl;
+    this.mindsCallbackSecret = config.mindsCallbackSecret;
+  }
+
+  async start(task: Task, execution: Execution): Promise<Execution> {
+    execution.status = "running";
+    execution.startedAt = new Date();
+
+    const payload = this.parsePayload(task);
+    await this.dispatchWorkflow(task, execution, payload);
+    execution.status = "running";
+    
+    return execution;
+  }
+
+  async status(execution: Execution): Promise<ExecutionStatus> {
+    if (!execution.workflowRunId) {
+      return execution.status;
+    }
+
+    try {
+      const run = await this.githubClient.getWorkflowRun(execution.workflowRunId);
+      switch (run.status) {
+        case "completed":
+          if (run.conclusion === "success") {
+            return "completed";
+          }
+          return "failed";
+        case "in_progress":
+        case "queued":
+        case "waiting":
+          return "running";
+        default:
+          return "running";
+      }
+    } catch {
+      return execution.status;
+    }
+  }
+
+  async stop(execution: Execution): Promise<void> {
+    if (execution.workflowRunId) {
+      try {
+        await this.githubClient.cancelWorkflowRun(execution.workflowRunId);
+      } catch {
+        // Ignore cancellation errors
+      }
+    }
+  }
+
+  private async dispatchWorkflow(
+    task: Task,
+    execution: Execution,
+    payload: GitHubEventPayload
+  ): Promise<void> {
+    const dispatchPayload = {
+      ref: "main",
+      inputs: {
+        task_id: task.id,
+        execution_id: execution.id,
+        event_type: task.type,
+        payload: JSON.stringify(payload),
+        minds_server_url: this.mindsServerUrl,
+        minds_callback_secret: this.mindsCallbackSecret,
+      },
+    };
+
+    await this.githubClient.dispatchWorkflow("minds-worker.yml", dispatchPayload);
+  }
+
+  private parsePayload(task: Task): GitHubEventPayload {
+    const prefix = `${task.type}: `;
+    const description = task.description.startsWith(prefix)
+      ? task.description.slice(prefix.length)
+      : task.description;
+
+    try {
+      const parsed = JSON.parse(description);
+      if (typeof parsed === "object" && parsed !== null) {
+        return parsed as GitHubEventPayload;
+      }
+    } catch {
+      // Description might not be JSON
+    }
+    return {};
+  }
+}
+
+export function createGitHubWorkerProvider(config: GitHubWorkerConfig): GitHubWorkerProvider {
+  return new GitHubWorkerProvider(config);
+}

@@ -1,0 +1,13 @@
+{
+  "extraKnownMarketplaces": {
+    "pstack": {
+      "source": {
+        "source": "github",
+        "repo": "grok08/copilot-pstack-plugin"
+      }
+    }
+  },
+  "enabledPlugins": {
+    "pstack@pstack": true
+  }
+}

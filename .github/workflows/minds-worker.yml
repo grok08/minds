@@ -1,0 +1,72 @@
+name: Minds Worker
+on:
+  workflow_dispatch:
+    inputs:
+      task_id:
+        description: "Task ID"
+        required: true
+        type: string
+      execution_id:
+        description: "Execution ID"
+        required: true
+        type: string
+      event_type:
+        description: "Event type (github.ci.failed, github.pull_request.opened, user.message)"
+        required: true
+        type: string
+      payload:
+        description: "JSON payload for the task"
+        required: true
+        type: string
+      minds_server_url:
+        description: "Minds server URL for callback"
+        required: true
+        type: string
+      minds_callback_secret:
+        description: "Secret for callback authentication"
+        required: true
+        type: string
+
+jobs:
+  execute:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v1
+        with:
+          bun-version: 1.4.2
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Execute worker task
+        id: worker
+        env:
+          TASK_ID: ${{ github.event.inputs.task_id }}
+          EXECUTION_ID: ${{ github.event.inputs.execution_id }}
+          EVENT_TYPE: ${{ github.event.inputs.event_type }}
+          PAYLOAD: ${{ github.event.inputs.payload }}
+          MINDS_SERVER_URL: ${{ github.event.inputs.minds_server_url }}
+          MINDS_CALLBACK_SECRET: ${{ github.event.inputs.minds_callback_secret }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          bun run packages/providers/github-worker/worker.ts
+
+      - name: Report failure if worker failed
+        if: failure() && steps.worker.outcome == 'failure'
+        env:
+          TASK_ID: ${{ github.event.inputs.task_id }}
+          EXECUTION_ID: ${{ github.event.inputs.execution_id }}
+          MINDS_SERVER_URL: ${{ github.event.inputs.minds_server_url }}
+          MINDS_CALLBACK_SECRET: ${{ github.event.inputs.minds_callback_secret }}
+        run: |
+          RESULT="Worker failed: ${STEP_CONTEXT}"
+          curl -X POST "${MINDS_SERVER_URL}/executions/${EXECUTION_ID}/result" \
+            -H "Content-Type: application/json" \
+            -H "X-Minds-Callback-Secret: ${MINDS_CALLBACK_SECRET}" \
+            -d "{\"taskId\":\"${TASK_ID}\",\"status\":\"failed\",\"error\":\"${RESULT}\"}"

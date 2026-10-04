@@ -1,0 +1,26 @@
+{
+  "name": "minds",
+  "private": true,
+  "type": "module",
+  "packageManager": "bun@1.4.2",
+  "scripts": {
+    "start": "bun apps/cli/src/demo.ts",
+    "test": "bun test",
+    "db:init": "bun packages/db/src/scripts/init.ts",
+    "db:migrate": "bun packages/db/src/scripts/run-migration.ts",
+    "test:integration": "bun tests/integration/github.integration.ts",
+    "verify:webhook-correlation": "bun tests/integration/verify-webhook-delivery.ts",
+    "server": "bun apps/server/src/server.ts"
+  },
+  "dependencies": {
+    "@octokit/rest": "^21.0.0",
+    "dotenv": "^18.0.5",
+    "fastify": "^4.28.0",
+    "pg": "^8.12.0"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.4.2",
+    "@types/pg": "^8.11.6",
+    "typescript": "^7.0.2"
+  }
+}
