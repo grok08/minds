@@ -156,49 +156,11 @@ server.post("/executions/:executionId/result", async (request, reply) => {
     const body = request.body as { taskId: string; status: "completed" | "failed"; result?: string; error?: string };
     const { taskId, status, result, error } = body;
 
-    if (!taskId || !status) {
-      return reply.code(400).send({ error: "Missing taskId or status" });
+    if (!taskId || (status !== "completed" && status !== "failed")) {
+      return reply.code(400).send({ error: "Missing taskId or invalid status" });
     }
 
-    const now = new Date();
-    
-    if (status === "completed") {
-      await query(
-        `UPDATE executions SET status = 'completed', result = $1, completed_at = $2 WHERE id = $3`,
-        [result ?? "", now, executionId]
-      );
-      await query(
-        `UPDATE tasks SET status = 'completed', result = $1, updated_at = $2 WHERE id = $3`,
-        [result ?? "", now, taskId]
-      );
-    } else {
-      await query(
-        `UPDATE executions SET status = 'failed', error = $1, completed_at = $2 WHERE id = $3`,
-        [error ?? "Worker failed", now, executionId]
-      );
-      await query(
-        `UPDATE tasks SET status = 'failed', error = $1, updated_at = $2 WHERE id = $3`,
-        [error ?? "Worker failed", now, taskId]
-      );
-    }
-
-    const mindResult = await query("SELECT mind_id FROM tasks WHERE id = $1", [taskId]);
-    if (mindResult.rows.length > 0) {
-      const mindId = mindResult.rows[0].mind_id;
-      await query(
-        `UPDATE minds SET state = 'sleeping', updated_at = $1 WHERE id = $2`,
-        [now, mindId]
-      );
-      await query(
-        `INSERT INTO state_transitions (id, mind_id, from_state, to_state, created_at)
-         VALUES ($1, $2, $3, $4, $5)`,
-        [generateId("transition"), mindId, "working", "sleeping", now]
-      );
-      await query(
-        `UPDATE events SET processed = true WHERE id = (SELECT event_id FROM tasks WHERE id = $1)`,
-        [taskId]
-      );
-    }
+    await mindRuntime.recordExecutionResult({ executionId, taskId, status, result, error });
 
     return reply.code(200).send({ message: "Result recorded" });
   } catch (error) {

@@ -9,6 +9,7 @@
     "db:init": "bun packages/db/src/scripts/init.ts",
     "db:migrate": "bun packages/db/src/scripts/run-migration.ts",
     "test:integration": "bun tests/integration/github.integration.ts",
+    "test:phase3": "bun tests/integration/github.integration.ts --phase3-only",
     "verify:webhook-correlation": "bun tests/integration/verify-webhook-delivery.ts",
     "server": "bun apps/server/src/server.ts"
   },

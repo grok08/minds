@@ -1,14 +1,21 @@
 import { describe, expect, test, beforeAll, afterAll, beforeEach } from "bun:test";
+import { randomUUID } from "node:crypto";
 import { PersistentMindRuntime } from "../../packages/runtime/src/runtime.ts";
+import { generateId } from "../../packages/runtime/src/domain/types.ts";
 import { createMockProvider } from "../../packages/providers/mock-provider.ts";
 import { query, closePool } from "../../packages/db/src/client.ts";
 
-const TEST_MIND_ID = "test-repository";
+const TEST_MIND_ID = `test-repository-${randomUUID()}`;
 
 describe("PersistentMindRuntime", () => {
   let runtime: PersistentMindRuntime;
 
   afterAll(async () => {
+    await query("DELETE FROM state_transitions WHERE mind_id = $1", [TEST_MIND_ID]);
+    await query("DELETE FROM executions WHERE task_id IN (SELECT id FROM tasks WHERE mind_id = $1)", [TEST_MIND_ID]);
+    await query("DELETE FROM tasks WHERE mind_id = $1", [TEST_MIND_ID]);
+    await query("DELETE FROM events WHERE mind_id = $1", [TEST_MIND_ID]);
+    await query("DELETE FROM minds WHERE id = $1", [TEST_MIND_ID]);
     await closePool();
   });
 
@@ -24,7 +31,7 @@ describe("PersistentMindRuntime", () => {
   });
 
   test("wakes for an event, records the result, and returns to sleep", async () => {
-    const eventId = "test-event-1";
+    const eventId = generateId("test-event");
 
     await runtime.handleEvent({
       id: eventId,
@@ -44,8 +51,105 @@ describe("PersistentMindRuntime", () => {
     expect(snapshot.executions[0].status).toBe("completed");
   });
 
+  test("records a worker result once and synchronizes runtime state", async () => {
+    const eventId = generateId("test-worker-callback");
+    runtime = new PersistentMindRuntime(TEST_MIND_ID, {
+      start: async (_task, execution) => execution,
+      status: async (execution) => execution.status,
+      stop: async () => {},
+    });
+    await runtime.initialize();
+
+    await runtime.handleEvent({
+      id: eventId,
+      type: "github.ci.failed",
+      payload: JSON.stringify({ runId: 123, workflow: "CI" }),
+    });
+
+    const runningSnapshot = await runtime.snapshot();
+    const runningTask = runningSnapshot.tasks[0];
+    const runningExecution = runningSnapshot.executions[0];
+
+    expect(runtime.getMindState()).toBe("working");
+    expect(runningTask.status).toBe("running");
+    expect(runningExecution.status).toBe("running");
+
+    await runtime.recordExecutionResult({
+      executionId: runningExecution.id,
+      taskId: runningTask.id,
+      status: "completed",
+      result: "Worker completed the CI investigation",
+    });
+    await runtime.recordExecutionResult({
+      executionId: runningExecution.id,
+      taskId: runningTask.id,
+      status: "completed",
+      result: "Worker completed the CI investigation",
+    });
+
+    const completedSnapshot = await runtime.snapshot();
+    const completedTask = completedSnapshot.tasks[0];
+    const completedExecution = completedSnapshot.executions[0];
+    const event = await query<{ processed: boolean }>(
+      "SELECT processed FROM events WHERE id = $1",
+      [eventId]
+    );
+
+    expect(runtime.getMindState()).toBe("sleeping");
+    expect(completedSnapshot.mind.state).toBe("sleeping");
+    expect(completedTask.status).toBe("completed");
+    expect(completedTask.result).toBe("Worker completed the CI investigation");
+    expect(completedExecution.status).toBe("completed");
+    expect(completedExecution.result).toBe("Worker completed the CI investigation");
+    expect(event.rows[0].processed).toBe(true);
+  });
+
+  test("records a failed worker result and leaves the Mind able to accept another event", async () => {
+    const eventId = generateId("test-worker-failure-callback");
+    runtime = new PersistentMindRuntime(TEST_MIND_ID, {
+      start: async (_task, execution) => execution,
+      status: async (execution) => execution.status,
+      stop: async () => {},
+    });
+    await runtime.initialize();
+
+    await runtime.handleEvent({
+      id: eventId,
+      type: "github.ci.failed",
+      payload: JSON.stringify({ runId: 456, workflow: "CI" }),
+    });
+
+    const runningSnapshot = await runtime.snapshot();
+    const runningTask = runningSnapshot.tasks[0];
+    const runningExecution = runningSnapshot.executions[0];
+
+    await runtime.recordExecutionResult({
+      executionId: runningExecution.id,
+      taskId: runningTask.id,
+      status: "failed",
+      error: "Worker process exited unsuccessfully",
+    });
+
+    const failedSnapshot = await runtime.snapshot();
+    expect(runtime.getMindState()).toBe("sleeping");
+    expect(failedSnapshot.tasks[0].status).toBe("failed");
+    expect(failedSnapshot.tasks[0].error).toBe("Worker process exited unsuccessfully");
+    expect(failedSnapshot.executions[0].status).toBe("failed");
+    expect(failedSnapshot.executions[0].error).toBe("Worker process exited unsuccessfully");
+
+    await runtime.handleEvent({
+      id: generateId("test-event-after-worker-failure"),
+      type: "demo.requested",
+      payload: "Continue after worker failure",
+    });
+
+    const nextSnapshot = await runtime.snapshot();
+    expect(nextSnapshot.tasks.at(-1)?.status).toBe("running");
+    expect(runtime.getMindState()).toBe("working");
+  });
+
   test("recovers state after restart", async () => {
-    const eventId = "test-event-recovery";
+    const eventId = generateId("test-event-recovery");
 
     await runtime.handleEvent({
       id: eventId,
@@ -67,9 +171,9 @@ describe("PersistentMindRuntime", () => {
   });
 
   test("fails interrupted work, returns to sleep, and accepts a new event after restart", async () => {
-    const interruptedEventId = "test-event-interrupted";
-    const interruptedTaskId = "test-task-interrupted";
-    const interruptedExecutionId = "test-execution-interrupted";
+    const interruptedEventId = generateId("test-event-interrupted");
+    const interruptedTaskId = generateId("test-task-interrupted");
+    const interruptedExecutionId = generateId("test-execution-interrupted");
     const startedAt = new Date();
 
     await query(
@@ -107,7 +211,7 @@ describe("PersistentMindRuntime", () => {
     );
     expect(recoveredEvent.rows[0].processed).toBe(true);
 
-    const nextEventId = "test-event-after-recovery";
+    const nextEventId = generateId("test-event-after-recovery");
     await runtime.handleEvent({
       id: nextEventId,
       type: "demo.requested",
@@ -120,7 +224,7 @@ describe("PersistentMindRuntime", () => {
   });
 
   test("idempotency: duplicate event is ignored", async () => {
-    const eventId = "test-idempotent-event";
+    const eventId = generateId("test-idempotent-event");
 
     await runtime.handleEvent({
       id: eventId,

@@ -258,7 +258,7 @@ async function waitForEventInDB(
   throw new Error(`Event ${eventType} not found in DB within ${timeoutMs}ms`);
 }
 
-async function waitForTaskCompletion(eventId: string, timeoutMs = 60000): Promise<any> {
+async function waitForTaskCompletion(eventId: string, timeoutMs = 180000): Promise<any> {
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
     const result = await query(
@@ -273,11 +273,16 @@ async function waitForTaskCompletion(eventId: string, timeoutMs = 60000): Promis
   throw new Error(`Task for event ${eventId} did not complete in time`);
 }
 
-async function verifyMindSleeping(): Promise<void> {
-  const result = await query("SELECT state FROM minds WHERE id = 'repository'");
-  if (result.rows[0]?.state !== "sleeping") {
-    throw new Error(`Mind not sleeping, state: ${result.rows[0]?.state}`);
+async function verifyMindSleeping(timeoutMs = 180000): Promise<void> {
+  const start = Date.now();
+  let state: string | undefined;
+  while (Date.now() - start < timeoutMs) {
+    const result = await query("SELECT state FROM minds WHERE id = 'repository'");
+    state = result.rows[0]?.state;
+    if (state === "sleeping") return;
+    await new Promise(r => setTimeout(r, 1000));
   }
+  throw new Error(`Mind did not return to sleeping within ${timeoutMs}ms, state: ${state}`);
 }
 
 async function getTaskCount(eventId: string): Promise<number> {
@@ -325,6 +330,9 @@ async function runScenario1_CIFailure() {
   if (task.status !== "completed") {
     throw new Error(`Task failed: ${task.error}`);
   }
+  if (!task.result?.includes(`Investigated CI failure for run ${run.id}`)) {
+    throw new Error(`Worker returned an unexpected CI investigation result: ${task.result}`);
+  }
 
   console.log("Verifying mind returned to sleeping...");
   await verifyMindSleeping();
@@ -367,6 +375,9 @@ async function runScenario2_PROpened() {
   console.log(`Task ${task.id} completed with status: ${task.status}`);
   if (task.status !== "completed") {
     throw new Error(`Task failed: ${task.error}`);
+  }
+  if (!task.result?.includes(`Analyzed PR #${prNumber}`)) {
+    throw new Error(`Worker returned an unexpected PR analysis result: ${task.result}`);
   }
 
   await verifyMindSleeping();
@@ -707,8 +718,11 @@ async function runScenario7_StateTransitions() {
 }
 
 async function main() {
+  const phase3Only = process.argv.includes("--phase3-only");
   console.log("╔══════════════════════════════════════════════════════════════╗");
-  console.log("║  Minds — End-to-End Integration Test                          ║");
+  console.log(phase3Only
+    ? "║  Minds — Phase 3 Worker Integration Test                     ║"
+    : "║  Minds — End-to-End Integration Test                          ║");
   console.log("║  Testing real GitHub webhook → Mind lifecycle → DB persistence ║");
   console.log("╚══════════════════════════════════════════════════════════════╝");
   
@@ -739,18 +753,20 @@ async function main() {
     
     await runScenario3_Idempotency(s1.run);
     results["Idempotency"] = true;
-    
-    await runScenario4_Recovery();
-    results["Recovery"] = true;
-    
-    await runScenario5_WorkerFailure();
-    results["Worker Failure"] = true;
-    
-    await runScenario6_ApprovalFlow();
-    results["Approval Flow"] = true;
-    
-    await runScenario7_StateTransitions();
-    results["State Transitions"] = true;
+
+    if (!phase3Only) {
+      await runScenario4_Recovery();
+      results["Recovery"] = true;
+
+      await runScenario5_WorkerFailure();
+      results["Worker Failure"] = true;
+
+      await runScenario6_ApprovalFlow();
+      results["Approval Flow"] = true;
+
+      await runScenario7_StateTransitions();
+      results["State Transitions"] = true;
+    }
     
   } catch (e) {
     console.error(`\n✗ TEST FAILED: ${e}`);

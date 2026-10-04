@@ -285,6 +285,98 @@ export class PersistentMindRuntime {
     this.mind.updatedAt = now;
   }
 
+  async recordExecutionResult(input: {
+    executionId: string;
+    taskId: string;
+    status: "completed" | "failed";
+    result?: string;
+    error?: string;
+  }): Promise<void> {
+    if (!this.mind) {
+      throw new Error("Runtime not initialized");
+    }
+
+    const now = new Date();
+    const result = input.status === "completed" ? input.result ?? "" : null;
+    const error = input.status === "failed" ? input.error ?? "Worker failed" : null;
+
+    await transaction(async (client) => {
+      const executions = await client.query<{
+        execution_status: Execution["status"];
+        execution_result: string | null;
+        execution_error: string | null;
+        task_status: Task["status"];
+        task_result: string | null;
+        task_error: string | null;
+        event_id: string;
+        mind_id: string;
+        mind_state: MindState;
+      }>(
+        `SELECT e.status AS execution_status, e.result AS execution_result, e.error AS execution_error,
+                t.status AS task_status, t.result AS task_result, t.error AS task_error,
+                t.event_id, t.mind_id, m.state AS mind_state
+         FROM executions e
+         JOIN tasks t ON t.id = e.task_id
+         JOIN minds m ON m.id = t.mind_id
+         WHERE e.id = $1 AND t.id = $2 AND t.mind_id = $3
+         FOR UPDATE OF e, t, m`,
+        [input.executionId, input.taskId, this.mindId]
+      );
+
+      const execution = executions.rows[0];
+      if (!execution) {
+        throw new Error("Execution does not belong to the task and Mind");
+      }
+
+      const alreadyRecorded = execution.execution_status === input.status &&
+        execution.task_status === input.status &&
+        (input.status === "completed"
+          ? execution.execution_result === result && execution.task_result === result
+          : execution.execution_error === error && execution.task_error === error);
+      if (alreadyRecorded) return;
+
+      if (execution.execution_status !== "running" || execution.task_status !== "running") {
+        throw new Error("Execution result conflicts with its persisted status");
+      }
+
+      if (input.status === "completed") {
+        await client.query(
+          `UPDATE executions SET status = 'completed', result = $1, completed_at = $2 WHERE id = $3`,
+          [result, now, input.executionId]
+        );
+        await client.query(
+          `UPDATE tasks SET status = 'completed', result = $1, updated_at = $2 WHERE id = $3`,
+          [result, now, input.taskId]
+        );
+      } else {
+        await client.query(
+          `UPDATE executions SET status = 'failed', error = $1, completed_at = $2 WHERE id = $3`,
+          [error, now, input.executionId]
+        );
+        await client.query(
+          `UPDATE tasks SET status = 'failed', error = $1, updated_at = $2 WHERE id = $3`,
+          [error, now, input.taskId]
+        );
+      }
+
+      await client.query("UPDATE events SET processed = true WHERE id = $1", [execution.event_id]);
+
+      if (execution.mind_state !== "sleeping") {
+        await client.query(
+          "UPDATE minds SET state = 'sleeping', updated_at = $1 WHERE id = $2",
+          [now, execution.mind_id]
+        );
+        await client.query(
+          `INSERT INTO state_transitions (id, mind_id, from_state, to_state, created_at)
+           VALUES ($1, $2, $3, $4, $5)`,
+          [generateId("transition"), execution.mind_id, execution.mind_state, "sleeping", now]
+        );
+      }
+    });
+
+    this.mind = await this.loadMind();
+  }
+
   async snapshot(): Promise<Snapshot> {
     if (!this.mind) {
       throw new Error("Runtime not initialized");
